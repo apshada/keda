@@ -25,14 +25,14 @@ import (
 	"go/parser"
 	"go/token"
 	"log"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/spf13/pflag"
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
 	"gopkg.in/yaml.v3"
 
 	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
@@ -131,7 +131,7 @@ func aggregateSchemaStruct(scalerSelectors map[string]string, kedaScalerStructs 
 	sort.Strings(sortedScalerNames)
 
 	for _, creatorName := range sortedScalerCreatorNames {
-		metadataFields := generateMetadataFields(kedaScalerStructs[creatorName], otherReferenceKedaTagStructs)
+		metadataFields := generateMetadataFields(kedaScalerStructs[creatorName], otherReferenceKedaTagStructs, false)
 		if len(metadataFields) == 0 {
 			fmt.Printf("Error generating metadata fields with creator %s: %s\n", creatorName, err)
 			continue
@@ -219,7 +219,7 @@ func aggregateSchemaStruct(scalerSelectors map[string]string, kedaScalerStructs 
 }
 
 // generateMetadataFields is a function that generates the metadata fields of a scaler struct
-func generateMetadataFields(structType *ast.StructType, otherReferenceKedaTagStructs map[string]*ast.StructType) []Parameters {
+func generateMetadataFields(structType *ast.StructType, otherReferenceKedaTagStructs map[string]*ast.StructType, parentOptional bool) []Parameters {
 	scalerMetadata := []Parameters{}
 
 	// get the tag of each field and generate the metadata
@@ -235,17 +235,21 @@ func generateMetadataFields(structType *ast.StructType, otherReferenceKedaTagStr
 		}
 
 		if !hasSubstruct {
+			if parentOptional {
+				for i := range metadataList {
+					metadataList[i].Optional = true
+				}
+			}
 			scalerMetadata = append(scalerMetadata, metadataList...)
 			continue
 		}
 
-		// If the field has a substruct, try to find substruct from reference structs
-		s, ok := commentGroup.Type.(*ast.Ident)
-		if !ok {
-			continue
-		}
-		if otherReferenceKedaTagStructs[s.Name] != nil {
-			subStructMetadataField := generateMetadataFields(otherReferenceKedaTagStructs[s.Name], otherReferenceKedaTagStructs)
+		// If the field has a substruct, try to find substruct from reference structs.
+		// A substruct field is only recognized by its bare `keda:"optional"` tag, so its
+		// fields are always parsed as optional at runtime.
+		subStructName := subStructTypeName(commentGroup.Type)
+		if subStructName != "" && otherReferenceKedaTagStructs[subStructName] != nil {
+			subStructMetadataField := generateMetadataFields(otherReferenceKedaTagStructs[subStructName], otherReferenceKedaTagStructs, true)
 			if len(subStructMetadataField) > 0 {
 				scalerMetadata = append(scalerMetadata, subStructMetadataField...)
 			}
@@ -253,6 +257,21 @@ func generateMetadataFields(structType *ast.StructType, otherReferenceKedaTagStr
 	}
 
 	return scalerMetadata
+}
+
+// subStructTypeName resolves the type name of a substruct field: *ast.Ident (same package),
+// *ast.SelectorExpr (other package, e.g. gcp.AuthMetadata) or *ast.StarExpr wrapping either
+// (pointer substructs, e.g. *authentication.Config).
+func subStructTypeName(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	case *ast.StarExpr:
+		return subStructTypeName(t.X)
+	}
+	return ""
 }
 
 // generateMetadatas is a function that generates the metadata field from tag
@@ -351,8 +370,7 @@ func retrieveDataFromOrder(orders []string) (bool, bool, bool, error) {
 	for _, po := range orders {
 		poTyped := scalersconfig.ParsingOrder(strings.TrimSpace(po))
 		if !scalersconfig.AllowedParsingOrderMap[poTyped] {
-			apo := maps.Keys(scalersconfig.AllowedParsingOrderMap)
-			slices.Sort(apo)
+			apo := slices.Sorted(maps.Keys(scalersconfig.AllowedParsingOrderMap))
 			return false, false, false, fmt.Errorf("unknown parsing order value %s, has to be one of %s", po, apo)
 		}
 		switch poTyped {
@@ -451,7 +469,13 @@ func getAllKedaTagedStructs(dir string) (map[string]*ast.StructType, map[string]
 
 	for _, e := range entries {
 		if e.IsDir() {
-			getAllKedaTagedStructs(dir + "/" + e.Name())
+			subScalerStructs, subTagStructs := getAllKedaTagedStructs(dir + "/" + e.Name())
+			for k, v := range subScalerStructs {
+				kedaScalerStructs[k] = v
+			}
+			for k, v := range subTagStructs {
+				kedaTagStructs[k] = v
+			}
 			continue
 		}
 

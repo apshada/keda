@@ -18,12 +18,13 @@ package executor
 
 import (
 	"context"
+	"maps"
 
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/scale"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -62,11 +63,11 @@ type scaleExecutor struct {
 	scaleClient      scale.ScalesGetter
 	reconcilerScheme *runtime.Scheme
 	logger           logr.Logger
-	recorder         record.EventRecorder
+	recorder         events.EventRecorder
 }
 
 // NewScaleExecutor creates a ScaleExecutor object
-func NewScaleExecutor(client runtimeclient.Client, scaleClient scale.ScalesGetter, reconcilerScheme *runtime.Scheme, recorder record.EventRecorder) ScaleExecutor {
+func NewScaleExecutor(client runtimeclient.Client, scaleClient scale.ScalesGetter, reconcilerScheme *runtime.Scheme, recorder events.EventRecorder) ScaleExecutor {
 	return &scaleExecutor{
 		client:           client,
 		scaleClient:      scaleClient,
@@ -87,9 +88,7 @@ func getTriggersActivity(object kedav1alpha1.ScalableObject, options ScaleExecut
 
 	if isPushScaler {
 		// for push scaler, copy existing activity and update the specific metric
-		for k, v := range object.GetStatusTriggersActivity() {
-			triggersActivity[k] = v
-		}
+		maps.Copy(triggersActivity, object.GetStatusTriggersActivity())
 		allTriggerNames = []string{pushScalerMetric}
 	} else {
 		allTriggerNames = object.GetStatusExternalMetricNames()

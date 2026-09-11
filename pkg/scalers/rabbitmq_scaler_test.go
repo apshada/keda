@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -22,8 +23,28 @@ import (
 
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
-	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
+
+type closeTrackingRabbitMQTransport struct {
+	closed bool
+}
+
+func (t *closeTrackingRabbitMQTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (t *closeTrackingRabbitMQTransport) CloseIdleConnections() {
+	t.closed = true
+}
+
+func TestRabbitMQScalerCloseClosesWrappedHTTPTransport(t *testing.T) {
+	transport := &closeTrackingRabbitMQTransport{}
+	scaler := &rabbitMQScaler{httpTransport: transport}
+
+	assert.NoError(t, scaler.Close(context.Background()))
+	assert.True(t, transport.closed)
+	assert.Nil(t, scaler.httpTransport)
+}
 
 const (
 	host             = "myHostSecret"
@@ -196,9 +217,35 @@ var testRabbitMQAuthParamData = []parseRabbitMQAuthParamTestData{
 	// failure, password from env but not username
 	{map[string]string{"queueName": "sample", "hostFromEnv": host, "passwordFromEnv": rabbitMQPassword}, v1alpha1.AuthPodIdentity{}, map[string]string{}, true, rmqTLSDisable, false},
 	// success, WorkloadIdentity
-	{map[string]string{"queueName": "sample", "hostFromEnv": host, "protocol": "http"}, v1alpha1.AuthPodIdentity{Provider: v1alpha1.PodIdentityProviderAzureWorkload, IdentityID: kedautil.StringPointer("client-id")}, map[string]string{"workloadIdentityResource": "rabbitmq-resource-id"}, false, rmqTLSDisable, true},
+	{map[string]string{"queueName": "sample", "hostFromEnv": host, "protocol": "http"}, v1alpha1.AuthPodIdentity{Provider: v1alpha1.PodIdentityProviderAzureWorkload, IdentityID: new("client-id")}, map[string]string{"workloadIdentityResource": "rabbitmq-resource-id"}, false, rmqTLSDisable, true},
 	// failure, WorkloadIdentity not supported for amqp
-	{map[string]string{"queueName": "sample", "hostFromEnv": host, "protocol": "amqp"}, v1alpha1.AuthPodIdentity{Provider: v1alpha1.PodIdentityProviderAzureWorkload, IdentityID: kedautil.StringPointer("client-id")}, map[string]string{"workloadIdentityResource": "rabbitmq-resource-id"}, true, rmqTLSDisable, false},
+	{map[string]string{"queueName": "sample", "hostFromEnv": host, "protocol": "amqp"}, v1alpha1.AuthPodIdentity{Provider: v1alpha1.PodIdentityProviderAzureWorkload, IdentityID: new("client-id")}, map[string]string{"workloadIdentityResource": "rabbitmq-resource-id"}, true, rmqTLSDisable, false},
+	// success, OAuth2 with HTTP protocol (minimal config)
+	{map[string]string{"queueName": "sample", "host": "http://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"oauthTokenURI": "https://oauth.example.com/token", "clientID": "my-client", "clientSecret": "my-secret"}, false, rmqTLSDisable, false},
+	// success, OAuth2 with scopes
+	{map[string]string{"queueName": "sample", "host": "https://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"oauthTokenURI": "https://oauth.example.com/token", "clientID": "my-client", "clientSecret": "my-secret", "scopes": "rabbitmq.read,rabbitmq.write"}, false, rmqTLSDisable, false},
+	// success, OAuth2 with endpoint params
+	{map[string]string{"queueName": "sample", "host": "http://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"oauthTokenURI": "https://oauth.example.com/token", "clientID": "my-client", "clientSecret": "my-secret", "endpointParams": "audience=rabbitmq&resource=api"}, false, rmqTLSDisable, false},
+	// success, OAuth2 with TLS
+	{map[string]string{"queueName": "sample", "host": "https://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"oauthTokenURI": "https://oauth.example.com/token", "clientID": "my-client", "clientSecret": "my-secret", "tls": "enable", "ca": "caaa"}, false, rmqTLSEnable, false},
+	// failure, OAuth2 with AMQP protocol
+	{map[string]string{"queueName": "sample", "host": "amqp://localhost:5672", "protocol": "amqp"}, v1alpha1.AuthPodIdentity{}, map[string]string{"oauthTokenURI": "https://oauth.example.com/token", "clientID": "my-client", "clientSecret": "my-secret"}, true, rmqTLSDisable, false},
+	// failure, OAuth2 + basic auth
+	{map[string]string{"queueName": "sample", "host": "http://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"oauthTokenURI": "https://oauth.example.com/token", "clientID": "my-client", "clientSecret": "my-secret", "username": "user", "password": "pass"}, true, rmqTLSDisable, false},
+	// failure, OAuth2 + workload identity
+	{map[string]string{"queueName": "sample", "host": "http://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"oauthTokenURI": "https://oauth.example.com/token", "clientID": "my-client", "clientSecret": "my-secret", "workloadIdentityResource": "rabbitmq-resource-id"}, true, rmqTLSDisable, false},
+	// failure, OAuth2 missing tokenUrl
+	{map[string]string{"queueName": "sample", "host": "http://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"clientID": "my-client", "clientSecret": "my-secret"}, true, rmqTLSDisable, false},
+	// failure, OAuth2 missing clientId
+	{map[string]string{"queueName": "sample", "host": "http://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"oauthTokenURI": "https://oauth.example.com/token", "clientSecret": "my-secret"}, true, rmqTLSDisable, false},
+	// failure, OAuth2 missing clientSecret
+	{map[string]string{"queueName": "sample", "host": "http://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"oauthTokenURI": "https://oauth.example.com/token", "clientID": "my-client"}, true, rmqTLSDisable, false},
+	// success, explicitly declared authModes basic with username/password
+	{map[string]string{"queueName": "sample", "host": "http://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"authModes": "basic", "username": "user", "password": "pass"}, false, rmqTLSDisable, false},
+	// success, explicitly declared authModes tls with cert/key/ca
+	{map[string]string{"queueName": "sample", "host": "https://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"authModes": "tls", "tls": "enable", "ca": "caaa", "cert": "ceert", "key": "keey"}, false, rmqTLSEnable, false},
+	// failure, declared authModes bearer is not supported by this scaler
+	{map[string]string{"queueName": "sample", "host": "http://localhost:15672", "protocol": "http"}, v1alpha1.AuthPodIdentity{}, map[string]string{"authModes": "bearer", "bearerToken": "token"}, true, rmqTLSDisable, false},
 }
 var rabbitMQMetricIdentifiers = []rabbitMQMetricIdentifier{
 	{&testRabbitMQMetadata[1], 0, "s0-rabbitmq-sample"},
@@ -231,6 +278,10 @@ func TestRabbitMQParseAuthParamData(t *testing.T) {
 		metadata, err := parseRabbitMQMetadata(&scalersconfig.ScalerConfig{ResolvedEnv: sampleRabbitMqResolvedEnv, TriggerMetadata: testData.metadata, AuthParams: testData.authParams, PodIdentity: testData.podIdentity})
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
+		}
+		// Also run validation to catch validation errors
+		if err == nil && metadata != nil {
+			err = metadata.Validate()
 		}
 		if testData.isError && err == nil {
 			t.Error("Expected error but got success")
@@ -432,9 +483,7 @@ func TestGetQueueInfo(t *testing.T) {
 			"hostFromEnv": host,
 			"protocol":    "http",
 		}
-		for k, v := range testData.extraMetadata {
-			metadata[k] = v
-		}
+		maps.Copy(metadata, testData.extraMetadata)
 
 		s, err := NewRabbitMQScaler(
 			&scalersconfig.ScalerConfig{
@@ -451,6 +500,7 @@ func TestGetQueueInfo(t *testing.T) {
 
 		ctx := context.TODO()
 		_, active, err := s.GetMetricsAndActivity(ctx, "Metric")
+		apiStub.Close()
 
 		if testData.responseStatus == http.StatusOK {
 			if err != nil {
@@ -467,6 +517,73 @@ func TestGetQueueInfo(t *testing.T) {
 		} else if !strings.Contains(err.Error(), testData.response) {
 			t.Error("Expect error to be like '", testData.response, "' but it's '", err, "'")
 		}
+	}
+}
+
+var testExpectedQueueConsumptionTimeTestData = []struct {
+	name          string
+	response      string
+	expectedMilli int64
+	isActive      bool
+}{
+	// empty idle queue: nothing to consume and nobody consuming - must be
+	// inactive with a zero metric so the workload can scale to zero
+	{name: "empty idle queue", response: `{"messages": 0, "messages_unacknowledged": 0, "message_stats": {"publish_details": {"rate": 0}, "deliver_get_details": {"rate": 0}}, "name": "evaluate_trials"}`, expectedMilli: 0, isActive: false},
+	// queue just drained, delivery rate still decaying: empty queue wins
+	{name: "empty queue with decaying delivery rate", response: `{"messages": 0, "messages_unacknowledged": 0, "message_stats": {"publish_details": {"rate": 0}, "deliver_get_details": {"rate": 2}}, "name": "evaluate_trials"}`, expectedMilli: 0, isActive: false},
+	// backlog with no consumers: consumption time cannot be estimated, report
+	// the activation value and activate so consumers get scaled up
+	{name: "backlog without consumers", response: `{"messages": 10, "messages_unacknowledged": 0, "message_stats": {"publish_details": {"rate": 3}, "deliver_get_details": {"rate": 0}}, "name": "evaluate_trials"}`, expectedMilli: 1000, isActive: true},
+	// steady state: eta = (publish-deliver)/deliver + messages/deliver = (3-2)/2 + 10/2 = 5.5
+	{name: "backlog with consumers", response: `{"messages": 10, "messages_unacknowledged": 0, "message_stats": {"publish_details": {"rate": 3}, "deliver_get_details": {"rate": 2}}, "name": "evaluate_trials"}`, expectedMilli: 5500, isActive: true},
+	// draining after publish stopped: eta = (0-2)/2 + 4/2 = 1, not above activation
+	{name: "draining backlog", response: `{"messages": 4, "messages_unacknowledged": 0, "message_stats": {"publish_details": {"rate": 0}, "deliver_get_details": {"rate": 2}}, "name": "evaluate_trials"}`, expectedMilli: 1000, isActive: false},
+}
+
+func TestExpectedQueueConsumptionTime(t *testing.T) {
+	for _, testData := range testExpectedQueueConsumptionTimeTestData {
+		var apiStub = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			// nosemgrep: no-direct-write-to-responsewriter
+			_, _ = w.Write([]byte(testData.response))
+		}))
+
+		resolvedEnv := map[string]string{host: apiStub.URL}
+
+		metadata := map[string]string{
+			"queueName":       "evaluate_trials",
+			"hostFromEnv":     host,
+			"protocol":        "http",
+			"mode":            "ExpectedQueueConsumptionTime",
+			"value":           "1",
+			"activationValue": "1",
+		}
+
+		s, err := NewRabbitMQScaler(
+			&scalersconfig.ScalerConfig{
+				ResolvedEnv:       resolvedEnv,
+				TriggerMetadata:   metadata,
+				AuthParams:        map[string]string{},
+				GlobalHTTPTimeout: 1000 * time.Millisecond,
+			},
+		)
+		if err != nil {
+			t.Fatal("Expect success", err)
+		}
+
+		metrics, active, err := s.GetMetricsAndActivity(context.TODO(), "Metric")
+		if err != nil {
+			t.Fatal("Expect success", err)
+		}
+
+		if got := metrics[0].Value.MilliValue(); got != testData.expectedMilli {
+			t.Error(testData.name, ": expect metric =", testData.expectedMilli, "milli but got", got)
+		}
+		if active != testData.isActive {
+			t.Error(testData.name, ": expect isActive =", testData.isActive, "but got", active)
+		}
+
+		apiStub.Close()
 	}
 }
 
@@ -593,9 +710,7 @@ func TestGetQueueInfoWithRegex(t *testing.T) {
 			"hostFromEnv": host,
 			"protocol":    "http",
 		}
-		for k, v := range testData.extraMetadata {
-			metadata[k] = v
-		}
+		maps.Copy(metadata, testData.extraMetadata)
 
 		s, err := NewRabbitMQScaler(
 			&scalersconfig.ScalerConfig{
@@ -612,6 +727,7 @@ func TestGetQueueInfoWithRegex(t *testing.T) {
 
 		ctx := context.TODO()
 		_, active, err := s.GetMetricsAndActivity(ctx, "Metric")
+		apiStub.Close()
 
 		if testData.responseStatus == http.StatusOK {
 			if err != nil {
@@ -696,6 +812,7 @@ func TestGetPageSizeWithRegex(t *testing.T) {
 
 		ctx := context.TODO()
 		_, active, err := s.GetMetricsAndActivity(ctx, "Metric")
+		apiStub.Close()
 
 		if err != nil {
 			t.Error("Expect success", err)
@@ -817,6 +934,7 @@ func TestRegexQueueMissingError(t *testing.T) {
 
 		ctx := context.TODO()
 		_, _, err = s.GetMetricsAndActivity(ctx, "Metric")
+		apiStub.Close()
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
 		}
@@ -1239,5 +1357,72 @@ func TestGetComposedQueue(t *testing.T) {
 			assert.InDelta(t, tt.expectedPubRate, result.MessageStat.PublishDetail.Rate, 0.001)
 			assert.InDelta(t, tt.expectedDelRate, result.MessageStat.DeliverGetDetail.Rate, 0.001)
 		})
+	}
+}
+
+func TestOAuth2HTTPClientCreation(t *testing.T) {
+	metadata := map[string]string{
+		"queueName": "sample",
+		"host":      "http://localhost:15672",
+		"protocol":  "http",
+	}
+
+	authParams := map[string]string{
+		"oauthTokenURI":  "https://oauth.example.com/token",
+		"clientID":       "my-client",
+		"clientSecret":   "my-secret",
+		"scopes":         "rabbitmq.read,rabbitmq.write",
+		"endpointParams": "audience=rabbitmq",
+	}
+
+	config := &scalersconfig.ScalerConfig{
+		ResolvedEnv:       sampleRabbitMqResolvedEnv,
+		TriggerMetadata:   metadata,
+		AuthParams:        authParams,
+		GlobalHTTPTimeout: 3000 * time.Millisecond,
+	}
+
+	s, err := NewRabbitMQScaler(config)
+	if err != nil {
+		t.Fatalf("Expected success but got error: %v", err)
+	}
+
+	scaler, ok := s.(*rabbitMQScaler)
+	if !ok {
+		t.Fatal("Expected rabbitMQScaler type")
+	}
+
+	// Verify that an HTTP client was created
+	if scaler.httpClient == nil {
+		t.Error("Expected HTTP client to be created for OAuth2")
+	}
+
+	// Verify OAuth2 metadata was parsed correctly
+	if !scaler.metadata.Auth.EnabledOAuth() {
+		t.Error("Expected Auth.EnabledOAuth() to be true")
+	}
+
+	if scaler.metadata.Auth.OauthTokenURI != "https://oauth.example.com/token" {
+		t.Errorf("Expected OauthTokenURI to be 'https://oauth.example.com/token' but got '%s'", scaler.metadata.Auth.OauthTokenURI)
+	}
+
+	if scaler.metadata.Auth.ClientID != "my-client" {
+		t.Errorf("Expected ClientID to be 'my-client' but got '%s'", scaler.metadata.Auth.ClientID)
+	}
+
+	if scaler.metadata.Auth.ClientSecret != "my-secret" {
+		t.Errorf("Expected ClientSecret to be 'my-secret' but got '%s'", scaler.metadata.Auth.ClientSecret)
+	}
+
+	assert.Equal(t, []string{"rabbitmq.read", "rabbitmq.write"}, scaler.metadata.Auth.Scopes)
+
+	if scaler.metadata.Auth.EndpointParams.Get("audience") != "rabbitmq" {
+		t.Errorf("Expected EndpointParams[audience] to be 'rabbitmq' but got '%s'", scaler.metadata.Auth.EndpointParams.Get("audience"))
+	}
+
+	// Clean up
+	err = scaler.Close(context.Background())
+	if err != nil {
+		t.Errorf("Error closing scaler: %v", err)
 	}
 }

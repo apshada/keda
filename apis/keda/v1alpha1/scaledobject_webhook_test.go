@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -61,6 +62,28 @@ var _ = It("should validate the so creation when there are other SO for other wo
 
 	Eventually(func() error {
 		return k8sClient.Create(context.Background(), so2)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("should validate the so creation when another SO targets the same name with a different Kind", func() {
+	// Regression coverage for the scaleTargetRefNameIdx field index: SOs
+	// sharing a scaleTargetRef.Name are returned by the indexed List
+	// together, and verifyScaledObjects must disambiguate them by GVK so a
+	// Deployment "foo" and a StatefulSet "foo" can coexist in one namespace.
+	namespaceName := "same-name-different-kind"
+	sharedTargetName := "shared-target"
+	namespace := createNamespace(namespaceName)
+	soDeployment := createScaledObject("so-for-deployment", namespaceName, sharedTargetName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	soStatefulSet := createScaledObject("so-for-statefulset", namespaceName, sharedTargetName, "apps/v1", "StatefulSet", false, map[string]string{}, "")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), soDeployment)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), soStatefulSet)
 	}).ShouldNot(HaveOccurred())
 })
 
@@ -577,6 +600,167 @@ var _ = It("shouldn't validate the so creation with cpu and memory when stateful
 	}).Should(HaveOccurred())
 })
 
+// The following tests cover cpu/memory requests declared at pod level (KEP-2837) instead of on the
+// containers. The HPA uses the pod-level request as the utilization denominator, so such a workload
+// is valid and must be accepted. See github.com/kedacore/keda/issues/8113
+var _ = It("should validate the so creation with cpu and memory when deployment has pod-level requests", func() {
+
+	namespaceName := "deployment-has-pod-level-requests"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+	workload.Spec.Template.Spec.Resources = &v1.ResourceRequirements{
+		Requests: v1.ResourceList{
+			v1.ResourceCPU:    *resource.NewMilliQuantity(100, resource.DecimalSI),
+			v1.ResourceMemory: *resource.NewQuantity(100*1024*1024, resource.BinarySI),
+		},
+	}
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+// A trigger that sets containerName produces an HPA ContainerResource metric, whose denominator is
+// the named container's own request. The HPA ignores pod-level requests in that case, so validation
+// must keep rejecting a container that declares none.
+var _ = It("shouldn't validate the so creation with cpu when the trigger sets containerName and only pod-level requests are declared", func() {
+
+	namespaceName := "deployment-pod-level-requests-container-name"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+	workload.Spec.Template.Spec.Resources = &v1.ResourceRequirements{
+		Requests: v1.ResourceList{
+			v1.ResourceCPU: *resource.NewMilliQuantity(100, resource.DecimalSI),
+		},
+	}
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	so.Spec.Triggers = []ScaleTriggers{
+		{
+			Type:       "cpu",
+			MetricType: v2.UtilizationMetricType,
+			Metadata: map[string]string{
+				"value":         "10",
+				"containerName": "test",
+			},
+		},
+	}
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(MatchError(ContainSubstring("the container test doesn't have the cpu request defined")))
+})
+
+var _ = It("should validate the so creation with cpu when the trigger sets containerName and that container declares requests", func() {
+
+	namespaceName := "deployment-container-requests-container-name"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	so.Spec.Triggers = []ScaleTriggers{
+		{
+			Type:       "cpu",
+			MetricType: v2.UtilizationMetricType,
+			Metadata: map[string]string{
+				"value":         "10",
+				"containerName": "test",
+			},
+		},
+	}
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+// A pod-level request only satisfies the trigger for the resource it declares, so a memory trigger
+// must still be rejected when only cpu is declared at pod level.
+var _ = It("shouldn't validate the so creation with cpu and memory when deployment has pod-level cpu request only", func() {
+
+	namespaceName := "deployment-pod-level-cpu-request-only"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+	workload.Spec.Template.Spec.Resources = &v1.ResourceRequirements{
+		Requests: v1.ResourceList{
+			v1.ResourceCPU: *resource.NewMilliQuantity(100, resource.DecimalSI),
+		},
+	}
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(MatchError(ContainSubstring("the scaledobject has a memory trigger")))
+})
+
+// Regression guard: container-level requests must keep satisfying the check when the pod-level
+// resources are present but declare nothing.
+var _ = It("should validate the so creation with cpu and memory when deployment has container requests and empty pod-level resources", func() {
+
+	namespaceName := "deployment-container-requests-empty-pod-level"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	workload.Spec.Template.Spec.Resources = &v1.ResourceRequirements{}
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("should validate the so creation with cpu and memory when statefulset has pod-level requests", func() {
+
+	namespaceName := "statefulset-has-pod-level-requests"
+	namespace := createNamespace(namespaceName)
+	workload := createStatefulSet(namespaceName, false, false)
+	workload.Spec.Template.Spec.Resources = &v1.ResourceRequirements{
+		Requests: v1.ResourceList{
+			v1.ResourceCPU:    *resource.NewMilliQuantity(100, resource.DecimalSI),
+			v1.ResourceMemory: *resource.NewQuantity(100*1024*1024, resource.BinarySI),
+		},
+	}
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "StatefulSet", true, map[string]string{}, "")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
 var _ = It("should validate the so creation without cpu and memory when custom resources", func() {
 
 	namespaceName := "crd-not-resources"
@@ -730,6 +914,88 @@ var _ = It("should validate the so update if it's removing the finalizer even if
 	Eventually(func() error {
 		return k8sClient.Update(context.Background(), so)
 	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("shouldn't validate the so creation when the name exceeds the label value limit", func() {
+
+	namespaceName := "so-name-too-long"
+	namespace := createNamespace(namespaceName)
+	longName := strings.Repeat("a", maxK8sLabelValueLength+1)
+	so := createScaledObject(longName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "short-hpa")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
+var _ = It("should validate the so creation when the name is at the label value limit and a custom HPA name is set", func() {
+
+	namespaceName := "so-name-max-with-custom-hpa"
+	namespace := createNamespace(namespaceName)
+	maxName := strings.Repeat("a", maxK8sLabelValueLength)
+	so := createScaledObject(maxName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "short-hpa")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("shouldn't validate the so creation when no custom HPA name is set and the generated HPA name would exceed the label value limit", func() {
+
+	namespaceName := "so-generated-hpa-too-long"
+	namespace := createNamespace(namespaceName)
+	// 55 chars: keda-hpa- prefix (9) + 55 = 64, overflows
+	longName := strings.Repeat("a", maxK8sLabelValueLength-len("keda-hpa-")+1)
+	so := createScaledObject(longName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
+var _ = It("should validate the so creation when no custom HPA name is set and the generated HPA name fits within the label value limit", func() {
+
+	namespaceName := "so-generated-hpa-max"
+	namespace := createNamespace(namespaceName)
+	// 54 chars: keda-hpa- prefix (9) + 54 = 63, fits
+	maxName := strings.Repeat("a", maxK8sLabelValueLength-len("keda-hpa-"))
+	so := createScaledObject(maxName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("shouldn't validate the so update when removing the custom HPA name would make the generated HPA name exceed the label value limit", func() {
+
+	namespaceName := "so-update-remove-custom-hpa"
+	namespace := createNamespace(namespaceName)
+	// 60 chars: passes create with custom HPA name, but keda-hpa-<60> = 69 would overflow
+	longName := strings.Repeat("a", 60)
+	so := createScaledObject(longName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "short-hpa")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), so)
+	Expect(err).ToNot(HaveOccurred())
+
+	so.Spec.Advanced.HorizontalPodAutoscalerConfig = nil
+	Eventually(func() error {
+		return k8sClient.Update(context.Background(), so)
+	}).Should(HaveOccurred())
 })
 
 var _ = It("shouldn't create so when stabilizationWindowSeconds exceeds 3600", func() {
@@ -1161,6 +1427,367 @@ var _ = It("should validate the so creation with ScalingModifiers.Formula - doub
 	}).ShouldNot(HaveOccurred())
 })
 
+// ======================== POLLINGINTERVAL WARNING TESTS ========================
+
+var _ = It("should emit warning when PollingInterval is set with minReplicaCount > 0 and idleReplicaCount not set", func() {
+	namespaceName := "polling-interval-warning-idle-not-set"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](1)
+	so.Spec.IdleReplicaCount = nil
+	so.Spec.PollingInterval = ptr.To[int32](30)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).To(ContainElement(ContainSubstring("PollingInterval is configured but is not relevant")))
+})
+
+var _ = It("should NOT emit warning when PollingInterval is set with minReplicaCount > 0 and idleReplicaCount > 0", func() {
+	namespaceName := "polling-interval-no-warning-idle-greater-zero"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](2)
+	so.Spec.IdleReplicaCount = ptr.To[int32](1)
+	so.Spec.PollingInterval = ptr.To[int32](30)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).ToNot(ContainElement(ContainSubstring("PollingInterval is configured but is not relevant")))
+})
+
+var _ = It("should NOT emit warning when PollingInterval is set with idleReplicaCount = 0", func() {
+	namespaceName := "polling-interval-no-warning-idle-zero"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](2)
+	so.Spec.IdleReplicaCount = ptr.To[int32](0)
+	so.Spec.PollingInterval = ptr.To[int32](30)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).ToNot(ContainElement(ContainSubstring("PollingInterval is configured but is not relevant")))
+})
+
+var _ = It("should NOT emit warning when PollingInterval is set with useCachedMetrics enabled", func() {
+	namespaceName := "polling-interval-no-warning-cached-metrics"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](2)
+	so.Spec.IdleReplicaCount = ptr.To[int32](1)
+	so.Spec.PollingInterval = ptr.To[int32](30)
+	so.Spec.Triggers = []ScaleTriggers{
+		{
+			Type:             "kubernetes-workload",
+			UseCachedMetrics: true,
+			Name:             "workload_trig_1",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+			MetricType: v2.ValueMetricType,
+		},
+	}
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).ToNot(ContainElement(ContainSubstring("PollingInterval is configured but is not relevant")))
+})
+
+var _ = It("should NOT emit warning when PollingInterval is set with scalingModifiers", func() {
+	namespaceName := "polling-interval-no-warning-scaling-modifiers"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](2)
+	so.Spec.IdleReplicaCount = nil
+	so.Spec.PollingInterval = ptr.To[int32](30)
+	so.Spec.Triggers = []ScaleTriggers{
+		{
+			Type: "kubernetes-workload",
+			Name: "workload_trig",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+	so.Spec.Advanced.ScalingModifiers = ScalingModifiers{Target: "2", Formula: "workload_trig + 1"}
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).ToNot(ContainElement(ContainSubstring("PollingInterval is configured but is not relevant")))
+})
+
+var _ = It("should NOT emit warning when PollingInterval is not set", func() {
+	namespaceName := "polling-interval-not-set"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](2)
+	so.Spec.IdleReplicaCount = ptr.To[int32](1)
+	so.Spec.PollingInterval = nil
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).ToNot(ContainElement(ContainSubstring("PollingInterval is configured but is not relevant")))
+})
+
+// ======================== COOLDOWNPERIOD WARNING TESTS ========================
+
+var _ = It("should emit warning when CooldownPeriod is set with minReplicaCount > 0 and idleReplicaCount not set", func() {
+	namespaceName := "cooldown-warning-idle-not-set"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](1)
+	so.Spec.IdleReplicaCount = nil
+	so.Spec.CooldownPeriod = ptr.To[int32](300)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).To(ContainElement(ContainSubstring("CooldownPeriod is configured but is not relevant")))
+})
+
+var _ = It("should NOT emit warning when CooldownPeriod is set with minReplicaCount > 0 and idleReplicaCount > 0", func() {
+	namespaceName := "cooldown-no-warning-idle-greater-zero"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](2)
+	so.Spec.IdleReplicaCount = ptr.To[int32](1)
+	so.Spec.CooldownPeriod = ptr.To[int32](300)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).ToNot(ContainElement(ContainSubstring("CooldownPeriod is configured but is not relevant")))
+})
+
+var _ = It("should NOT emit warning when CooldownPeriod is set with idleReplicaCount = 0", func() {
+	namespaceName := "cooldown-no-warning-idle-zero"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](2)
+	so.Spec.IdleReplicaCount = ptr.To[int32](0)
+	so.Spec.CooldownPeriod = ptr.To[int32](300)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).ToNot(ContainElement(ContainSubstring("CooldownPeriod is configured but is not relevant")))
+})
+
+var _ = It("should NOT emit warning when CooldownPeriod is not set", func() {
+	namespaceName := "cooldown-not-set"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](2)
+	so.Spec.IdleReplicaCount = ptr.To[int32](1)
+	so.Spec.CooldownPeriod = nil
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).ToNot(ContainElement(ContainSubstring("CooldownPeriod is configured but is not relevant")))
+})
+
+// ======================== COMBINED WARNING TESTS ========================
+
+var _ = It("should emit both warnings when both PollingInterval and CooldownPeriod are misconfigured", func() {
+	namespaceName := "both-warnings"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](2)
+	so.Spec.IdleReplicaCount = nil
+	so.Spec.PollingInterval = ptr.To[int32](30)
+	so.Spec.CooldownPeriod = ptr.To[int32](300)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).To(ContainElement(ContainSubstring("PollingInterval is configured but is not relevant")))
+	Expect(warnings).To(ContainElement(ContainSubstring("CooldownPeriod is configured but is not relevant")))
+})
+
+var _ = It("should emit no warnings when both are properly configured with idleReplicaCount = 0", func() {
+	namespaceName := "both-no-warnings-idle-zero"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+
+	so.Spec.MinReplicaCount = ptr.To[int32](2)
+	so.Spec.IdleReplicaCount = ptr.To[int32](0)
+	so.Spec.PollingInterval = ptr.To[int32](30)
+	so.Spec.CooldownPeriod = ptr.To[int32](300)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	warnings, err := so.ValidateCreate(new(false))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(warnings).To(BeEmpty())
+})
+
+var _ = It("should validate the so creation with scalingModifiers fallback behavior", func() {
+	namespaceName := "scaling-modifiers-fallback-valid"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+
+	sm := ScalingModifiers{Target: "2", Formula: "trig_one ?? trig_two ?? 5"}
+	triggers := []ScaleTriggers{
+		{
+			Type: "cron",
+			Name: "trig_one",
+			Metadata: map[string]string{
+				"timezone":        "UTC",
+				"start":           "0 * * * *",
+				"end":             "1 * * * *",
+				"desiredReplicas": "1",
+			},
+		},
+		{
+			Type: "kubernetes-workload",
+			Name: "trig_two",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+
+	so := createScaledObjectScalingModifiers(namespaceName, sm, triggers)
+	so.Spec.Fallback = &Fallback{
+		FailureThreshold: 3,
+		Replicas:         5,
+		Behavior:         FallbackBehaviorScalingModifiers,
+	}
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("shouldn't validate the so creation with scalingModifiers fallback without formula", func() {
+	namespaceName := "scaling-modifiers-fallback-no-formula"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+
+	triggers := []ScaleTriggers{
+		{
+			Type: "cron",
+			Metadata: map[string]string{
+				"timezone":        "UTC",
+				"start":           "0 * * * *",
+				"end":             "1 * * * *",
+				"desiredReplicas": "1",
+			},
+		},
+	}
+
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	so.Spec.Triggers = triggers
+	so.Spec.Fallback = &Fallback{
+		FailureThreshold: 3,
+		Replicas:         5,
+		Behavior:         FallbackBehaviorScalingModifiers,
+	}
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
 var _ = AfterSuite(func() {
 	cancel()
 	By("tearing down the test environment")
@@ -1405,8 +2032,8 @@ func createScaledObjectSTZ(name string, namespace string, targetName string, min
 			ScaleTargetRef: &ScaleTarget{
 				Name: targetName,
 			},
-			MinReplicaCount: ptr.To(minReplicas),
-			MaxReplicaCount: ptr.To(maxReplicas),
+			MinReplicaCount: new(minReplicas),
+			MaxReplicaCount: new(maxReplicas),
 			CooldownPeriod:  ptr.To[int32](1),
 			Triggers:        triggers,
 		},

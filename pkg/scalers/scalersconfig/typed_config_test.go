@@ -17,12 +17,15 @@ limitations under the License.
 package scalersconfig
 
 import (
+	"fmt"
 	"net/url"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/klog/v2"
 )
 
 // TestBasicTypedConfig tests the basic types for typed config
@@ -705,6 +708,40 @@ func TestUnexpectedOptional(t *testing.T) {
 	Expect(mockRecorder.Messages).To(ContainElement("Unmatched input property notValFromEnv in scaler testScaler"))
 }
 
+// TestNestedOptionalParamNamesPropagate verifies that when a scaler embeds an optional nested struct (e.g. *authentication.Config), the field names declared inside that nested struct count as parsed for the parent.
+func TestNestedOptionalParamNamesPropagate(t *testing.T) {
+	RegisterTestingT(t)
+	prev := checkUnexpectedParamEnabled
+	checkUnexpectedParamEnabled = true
+	defer func() { checkUnexpectedParamEnabled = prev }()
+
+	type nestedAuth struct {
+		Modes []string `keda:"name=authModes;authMode, order=triggerMetadata, optional"`
+		Token string   `keda:"name=token,              order=authParams,      optional"`
+	}
+	type scalerStruct struct {
+		TriggerIndex int
+		Auth         *nestedAuth `keda:"optional"`
+		Other        string      `keda:"name=other, order=triggerMetadata"`
+	}
+
+	mockRec := &MockEventRecorder{Messages: make([]string, 0)}
+	sc := &ScalerConfig{
+		TriggerMetadata: map[string]string{
+			"authModes": "bearer",
+			"other":     "x",
+		},
+		AuthParams:  map[string]string{"token": "abc"},
+		Recorder:    mockRec,
+		TriggerType: "fakeScaler",
+	}
+
+	s := scalerStruct{}
+	err := sc.TypedConfig(&s)
+	Expect(err).To(BeNil())
+	Expect(mockRec.Messages).To(BeEmpty(), "authModes was matched via the nested struct, no warnings expected")
+}
+
 // MockEventRecorder is a mock implementation of record.EventRecorder
 type MockEventRecorder struct {
 	EventCalled bool
@@ -712,16 +749,12 @@ type MockEventRecorder struct {
 	Messages    []string
 }
 
-func (m *MockEventRecorder) Event(object runtime.Object, eventtype, reason, message string) {
+func (m *MockEventRecorder) Eventf(regarding, related runtime.Object, eventtype, reason, action, note string, args ...any) {
 	m.EventCalled = true
-	m.Message = message
-	m.Messages = append(m.Messages, message)
+	m.Message = fmt.Sprintf(note, args...)
+	m.Messages = append(m.Messages, m.Message)
 }
 
-func (m *MockEventRecorder) Eventf(object runtime.Object, eventtype, reason, messageFmt string, args ...interface{}) {
-	// Not needed
-}
-
-func (m *MockEventRecorder) AnnotatedEventf(object runtime.Object, annotations map[string]string, eventtype, reason, messageFmt string, args ...interface{}) {
-	// Not needed
+func (m *MockEventRecorder) WithLogger(logger klog.Logger) events.EventRecorderLogger {
+	return m
 }

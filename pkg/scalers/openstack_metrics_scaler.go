@@ -55,7 +55,7 @@ type openstackMetricScaler struct {
 }
 
 type measureResult struct {
-	measures [][]interface{}
+	measures [][]any
 }
 
 /*  end of declarations */
@@ -235,7 +235,7 @@ func (s *openstackMetricScaler) readOpenstackMetrics(ctx context.Context) (float
 	var currTimeWithWindow string
 
 	if granularity > 0 {
-		currTimeWithWindow = time.Now().Add(time.Minute * time.Duration(granularity)).Format(time.RFC3339)
+		currTimeWithWindow = time.Now().Add(-time.Minute * time.Duration(granularity)).Format(time.RFC3339)
 	} else {
 		currTimeWithWindow = time.Now().Format(time.RFC3339)
 	}
@@ -288,7 +288,7 @@ func (s *openstackMetricScaler) readOpenstackMetrics(ctx context.Context) (float
 		return defaultValueWhenError, errUnMarshall
 	}
 
-	var targetMeasure []interface{}
+	var targetMeasure []any
 
 	if len(m.measures) > 0 {
 		targetMeasure = m.measures[len(m.measures)-1]

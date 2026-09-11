@@ -185,8 +185,8 @@ func (sc *ScalerConfig) validateTriggerIndex(typedConfig any) error {
 	}
 
 	hasTriggerIndex := false
-	for i := 0; i < t.NumField(); i++ {
-		fieldName := t.Field(i).Name
+	for field := range t.Fields() {
+		fieldName := field.Name
 		if fieldName == "triggerIndex" || fieldName == "TriggerIndex" {
 			hasTriggerIndex = true
 			break
@@ -253,7 +253,7 @@ func (sc *ScalerConfig) setValue(field reflect.Value, params Params) ([]string, 
 		if sc.Recorder != nil {
 			message := fmt.Sprintf("scaler %s info: %s", sc.TriggerType, params.DeprecatedAnnounce)
 			fmt.Print(message)
-			sc.Recorder.Event(sc.ScaledObject, corev1.EventTypeNormal, eventreason.KEDAScalersInfo, message)
+			sc.Recorder.Eventf(sc.ScaledObject, nil, corev1.EventTypeNormal, eventreason.KEDAScalersInfo, eventreason.KEDAScalersInfo, "%s", message)
 		}
 	}
 	if !exists && params.Default != "" {
@@ -305,7 +305,7 @@ func (sc *ScalerConfig) setValue(field reflect.Value, params Params) ([]string, 
 		}
 	}
 	if params.IsNested() {
-		for field.Kind() == reflect.Ptr {
+		for field.Kind() == reflect.Pointer {
 			field.Set(reflect.New(field.Type().Elem()))
 			field = field.Elem()
 		}
@@ -447,7 +447,7 @@ func setConfigValueHelper(params Params, valFromConfig string, field reflect.Val
 		field.Set(paramValue.Convert(field.Type()))
 		return nil
 	}
-	if field.Type() == reflect.TypeOf(time.Duration(0)) {
+	if field.Type() == reflect.TypeFor[time.Duration]() {
 		// Try to parse as duration string first
 		duration, err := time.ParseDuration(valFromConfig)
 		if err == nil {
@@ -468,7 +468,7 @@ func setConfigValueHelper(params Params, valFromConfig string, field reflect.Val
 		field.Set(reflect.ValueOf(time.Duration(milliseconds) * time.Millisecond))
 		return nil
 	}
-	if field.Type() == reflect.TypeOf(url.Values{}) {
+	if field.Type() == reflect.TypeFor[url.Values]() {
 		return setConfigValueURLParams(params, valFromConfig, field)
 	}
 	if field.Kind() == reflect.Map {
@@ -544,7 +544,7 @@ func (sc *ScalerConfig) checkUnexpectedParameterExist(parsedParamNames []string,
 				message := fmt.Sprintf("Unmatched input property %s in scaler %s", key+suffix, scalerIdentifier)
 				// Just logging as it's optional property checking and should not block the scaling
 				logger.Error(nil, message)
-				sc.Recorder.Event(sc.ScaledObject, corev1.EventTypeWarning, eventreason.KEDAScalersInfo, message)
+				sc.Recorder.Eventf(sc.ScaledObject, nil, corev1.EventTypeWarning, eventreason.KEDAScalersInfo, eventreason.KEDAScalersInfo, "%s", message)
 			}
 		}
 	}
@@ -553,8 +553,8 @@ func (sc *ScalerConfig) checkUnexpectedParameterExist(parsedParamNames []string,
 // paramsFromTag is a function that returns the Params struct based on the field tag
 func paramsFromTag(tag string, field reflect.StructField) (Params, error) {
 	params := Params{FieldName: field.Name}
-	tagSplit := strings.Split(tag, TagSeparator)
-	for _, ts := range tagSplit {
+	tagSplit := strings.SplitSeq(tag, TagSeparator)
+	for ts := range tagSplit {
 		tsplit := strings.Split(ts, TagKeySeparator)
 		tsplit[0] = strings.TrimSpace(tsplit[0])
 		switch tsplit[0] {
@@ -567,8 +567,8 @@ func paramsFromTag(tag string, field reflect.StructField) (Params, error) {
 			}
 		case OrderTag:
 			if len(tsplit) > 1 {
-				order := strings.Split(tsplit[1], TagValueSeparator)
-				for _, po := range order {
+				order := strings.SplitSeq(tsplit[1], TagValueSeparator)
+				for po := range order {
 					poTyped := ParsingOrder(strings.TrimSpace(po))
 					if !AllowedParsingOrderMap[poTyped] {
 						apo := slices.Sorted(maps.Keys(AllowedParsingOrderMap))

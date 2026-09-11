@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -143,6 +144,20 @@ func TestGitHubRunnerParseMetadata(t *testing.T) {
 	}
 }
 
+func TestGitHubRunnerBearerAuthModeWithPersonalAccessToken(t *testing.T) {
+	meta, err := parseGitHubRunnerMetadata(&scalersconfig.ScalerConfig{
+		ResolvedEnv:     testGitHubRunnerResolvedEnv,
+		TriggerMetadata: map[string]string{"githubApiURL": "https://api.github.com", "runnerScope": ORG, "owner": "ownername", "targetWorkflowQueueLength": "1"},
+		AuthParams:      map[string]string{"authModes": "bearer", "personalAccessToken": "sample"},
+	})
+	if err != nil {
+		t.Fatalf("expected no error but got %s", err)
+	}
+	if !meta.Auth.EnabledBearerAuth() || meta.Auth.BearerToken != "sample" {
+		t.Fatalf("expected bearer auth with personalAccessToken mapped, got modes %v and token %q", meta.Auth.Modes, meta.Auth.BearerToken)
+	}
+}
+
 func getGitHubTestMetaData(url string) *githubRunnerMetadata {
 	testpat := "testpat"
 
@@ -171,7 +186,7 @@ func buildQueueJSON() []byte {
 func generateResponseExceed30Repos() []byte {
 	var repos []Repo
 
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		var repository Repo
 		id, _ := rand.Int(rand.Reader, big.NewInt(100000))
 		repository.ID = int(id.Int64())
@@ -503,8 +518,8 @@ func TestNewGitHubRunnerScaler_QueueLength_SingleRepo_WithNotModified(t *testing
 	if err := json.Unmarshal([]byte(testGhWFJobResponse), &jobs); err != nil {
 		t.Fail()
 	}
-	previousJobs := map[string][]Job{
-		"Hello-World": jobs.Jobs,
+	previousJobs := map[jobCacheKey][]Job{
+		{repo: "Hello-World", runID: 30433642}: jobs.Jobs,
 	}
 
 	mockGitHubRunnerScaler := githubRunnerScaler{
@@ -861,6 +876,251 @@ type githubRunnerMetricIdentifier struct {
 var githubRunnerMetricIdentifiers = []githubRunnerMetricIdentifier{
 	{&testGitHubRunnerMetadata[1].metadata, 0, "s0-github-runner-ownername"},
 	{&testGitHubRunnerMetadata[1].metadata, 1, "s1-github-runner-ownername"},
+}
+
+func TestGithubRunnerPruneCachesDropsAbsentWfrRepos(t *testing.T) {
+	s := githubRunnerScaler{
+		metadata:     &githubRunnerMetadata{},
+		previousJobs: map[jobCacheKey][]Job{},
+		previousWfrs: map[string]map[string]*WorkflowRuns{
+			"keep-1": {"queued": &WorkflowRuns{}},
+			"drop-2": {"queued": &WorkflowRuns{}},
+		},
+		etags: map[string]string{},
+	}
+
+	s.pruneCaches([]string{"keep-1"})
+
+	if _, ok := s.previousWfrs["drop-2"]; ok {
+		t.Errorf("previousWfrs still contains drop-2 after prune")
+	}
+	if _, ok := s.previousWfrs["keep-1"]; !ok {
+		t.Errorf("previousWfrs lost keep-1 after prune")
+	}
+}
+
+func TestGithubRunnerPruneCompletedJobsDropsFinishedRuns(t *testing.T) {
+	meta := &githubRunnerMetadata{GithubAPIURL: "https://api.github.com", Owner: "owner"}
+
+	s := githubRunnerScaler{
+		metadata: meta,
+		previousJobs: map[jobCacheKey][]Job{
+			{repo: "repo", runID: 100}: nil, // still active, kept
+			{repo: "repo", runID: 200}: nil, // completed, dropped
+		},
+	}
+	s.etags = map[string]string{
+		s.jobsAPIURL("repo", 100): "etag-100", // still active, kept
+		s.jobsAPIURL("repo", 200): "etag-200", // completed, dropped
+	}
+
+	s.pruneCompletedJobs([]WorkflowRun{
+		{ID: 100, Repository: Repo{Name: "repo"}},
+	})
+
+	if _, ok := s.previousJobs[jobCacheKey{repo: "repo", runID: 200}]; ok {
+		t.Errorf("previousJobs still contains completed run 200 after pruneCompletedJobs")
+	}
+	if _, ok := s.previousJobs[jobCacheKey{repo: "repo", runID: 100}]; !ok {
+		t.Errorf("previousJobs lost still-active run 100 after pruneCompletedJobs")
+	}
+	if _, ok := s.etags[s.jobsAPIURL("repo", 200)]; ok {
+		t.Errorf("etags still contains completed run 200's jobs URL after pruneCompletedJobs")
+	}
+	if _, ok := s.etags[s.jobsAPIURL("repo", 100)]; !ok {
+		t.Errorf("etags lost still-active run 100's jobs URL after pruneCompletedJobs")
+	}
+}
+
+func TestGithubRunnerPruneCachesBoundsMaps(t *testing.T) {
+	overflow := githubScalerMaxCacheEntries + 100
+	currentRepos := make([]string, overflow)
+
+	s := githubRunnerScaler{
+		metadata:     &githubRunnerMetadata{},
+		previousJobs: make(map[jobCacheKey][]Job, overflow),
+		previousWfrs: make(map[string]map[string]*WorkflowRuns, overflow),
+		etags:        make(map[string]string, overflow),
+	}
+	for i := range overflow {
+		repo := fmt.Sprintf("repo-%d", i)
+		currentRepos[i] = repo
+		s.etags[fmt.Sprintf("https://api.github.com/run/%d", i)] = "etag"
+		// Two runs per repo, so the (repo, runID) pair count exceeds the repo
+		// count and genuinely tests the total-entries bound, not just len(map).
+		s.previousJobs[jobCacheKey{repo: repo, runID: int64(i)}] = nil
+		s.previousJobs[jobCacheKey{repo: repo, runID: int64(i + overflow)}] = nil
+		s.previousWfrs[repo] = map[string]*WorkflowRuns{"queued": {}}
+	}
+
+	s.pruneCaches(currentRepos)
+
+	if got := len(s.etags); got > githubScalerMaxCacheEntries {
+		t.Errorf("etags map size %d exceeds cap %d after prune", got, githubScalerMaxCacheEntries)
+	}
+	if got := len(s.previousJobs); got > githubScalerMaxCacheEntries {
+		t.Errorf("previousJobs map size %d exceeds cap %d after prune", got, githubScalerMaxCacheEntries)
+	}
+	if got := len(s.previousWfrs); got > githubScalerMaxCacheEntries {
+		t.Errorf("previousWfrs map size %d exceeds cap %d after prune", got, githubScalerMaxCacheEntries)
+	}
+}
+
+func TestGetWorkflowRunJobs_StaleEtagWithoutPreviousRetries(t *testing.T) {
+	var mu sync.Mutex
+	var sawIfNoneMatch, sawNoIfNoneMatch bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if r.Header.Get("If-None-Match") != "" {
+			sawIfNoneMatch = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		sawNoIfNoneMatch = true
+		mu.Unlock()
+		w.Header().Set("ETag", `"fresh-etag"`)
+		// nosemgrep: no-direct-write-to-responsewriter
+		_, _ = w.Write([]byte(testGhWFJobResponse))
+	}))
+	defer srv.Close()
+
+	meta := getGitHubTestMetaData(srv.URL)
+	meta.EnableEtags = true
+	apiURL := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=100",
+		meta.GithubAPIURL, meta.Owner, "Hello-World", int64(30433642))
+
+	s := githubRunnerScaler{
+		metadata:     meta,
+		httpClient:   http.DefaultClient,
+		etags:        map[string]string{apiURL: `"stale-etag"`},
+		previousJobs: map[jobCacheKey][]Job{},
+		previousWfrs: map[string]map[string]*WorkflowRuns{},
+	}
+
+	jobs, err := s.getWorkflowRunJobs(context.Background(), 30433642, "Hello-World")
+	if err != nil {
+		t.Fatalf("expected retry to succeed, got error: %v", err)
+	}
+	if len(jobs) == 0 {
+		t.Fatalf("expected jobs from retry, got empty slice")
+	}
+	mu.Lock()
+	gotIfNoneMatch, gotNoIfNoneMatch := sawIfNoneMatch, sawNoIfNoneMatch
+	mu.Unlock()
+	if !gotIfNoneMatch || !gotNoIfNoneMatch {
+		t.Fatalf("expected one request with If-None-Match and one without, got ifNoneMatch=%v noIfNoneMatch=%v", gotIfNoneMatch, gotNoIfNoneMatch)
+	}
+	if got := s.etags[apiURL]; got != `"fresh-etag"` {
+		t.Fatalf("expected etag to be refreshed to %q, got %q", `"fresh-etag"`, got)
+	}
+}
+
+// TestGetWorkflowRunJobs_PerRunCacheDoesNotConflateConcurrentRuns is a
+// regression test for a bug where previousJobs was keyed by repo name only.
+// A repository can have several workflow runs queued/in_progress at once
+// (e.g. a matrix-heavy release workflow plus a concurrent scheduled sync
+// run); getWorkflowRunJobs is called once per run, and a 304 for one run's
+// jobs URL must return that same run's own cached jobs, not whichever run's
+// jobs happened to be cached last for the repo.
+func TestGetWorkflowRunJobs_PerRunCacheDoesNotConflateConcurrentRuns(t *testing.T) {
+	const repo = "repo"
+	const runA, runB int64 = 100, 200
+
+	jobsA := []Job{{ID: 1, RunID: int(runA), Status: "queued", Labels: []string{"foo", "bar"}}}
+	jobsB := []Job{{ID: 2, RunID: int(runB), Status: "queued", Labels: []string{"foo", "bar"}}}
+
+	// Both runs' etags are already known from an earlier poll, so any request
+	// in this test is answered with 304 Not Modified.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+
+	meta := getGitHubTestMetaData(srv.URL)
+	meta.EnableEtags = true
+
+	urlA := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=100", meta.GithubAPIURL, meta.Owner, repo, runA)
+	urlB := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=100", meta.GithubAPIURL, meta.Owner, repo, runB)
+
+	s := githubRunnerScaler{
+		metadata:   meta,
+		httpClient: http.DefaultClient,
+		etags: map[string]string{
+			urlA: `"etag-a"`,
+			urlB: `"etag-b"`,
+		},
+		previousJobs: map[jobCacheKey][]Job{
+			{repo: repo, runID: runA}: jobsA,
+			{repo: repo, runID: runB}: jobsB,
+		},
+	}
+
+	got, err := s.getWorkflowRunJobs(context.Background(), runA, repo)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].RunID != int(runA) {
+		t.Fatalf("expected run %d's own cached jobs, got jobs from run_id=%v", runA, got)
+	}
+
+	got, err = s.getWorkflowRunJobs(context.Background(), runB, repo)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].RunID != int(runB) {
+		t.Fatalf("expected run %d's own cached jobs, got jobs from run_id=%v", runB, got)
+	}
+}
+
+func TestGetWorkflowRuns_StaleEtagWithoutPreviousRetries(t *testing.T) {
+	var mu sync.Mutex
+	var sawIfNoneMatch, sawNoIfNoneMatch bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if r.Header.Get("If-None-Match") != "" {
+			sawIfNoneMatch = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		sawNoIfNoneMatch = true
+		mu.Unlock()
+		w.Header().Set("ETag", `"fresh-etag"`)
+		// nosemgrep: no-direct-write-to-responsewriter
+		_, _ = w.Write([]byte(testGhWorkflowResponse))
+	}))
+	defer srv.Close()
+
+	meta := getGitHubTestMetaData(srv.URL)
+	meta.EnableEtags = true
+	apiURL := fmt.Sprintf("%s/repos/%s/%s/actions/runs?status=%s&per_page=100",
+		meta.GithubAPIURL, meta.Owner, "Hello-World", "queued")
+
+	s := githubRunnerScaler{
+		metadata:     meta,
+		httpClient:   http.DefaultClient,
+		etags:        map[string]string{apiURL: `"stale-etag"`},
+		previousJobs: map[jobCacheKey][]Job{},
+		previousWfrs: map[string]map[string]*WorkflowRuns{},
+	}
+
+	wfrs, err := s.getWorkflowRuns(context.Background(), "Hello-World", "queued")
+	if err != nil {
+		t.Fatalf("expected retry to succeed, got error: %v", err)
+	}
+	if wfrs == nil || len(wfrs.WorkflowRuns) == 0 {
+		t.Fatalf("expected workflow runs from retry, got empty result")
+	}
+	mu.Lock()
+	gotIfNoneMatch, gotNoIfNoneMatch := sawIfNoneMatch, sawNoIfNoneMatch
+	mu.Unlock()
+	if !gotIfNoneMatch || !gotNoIfNoneMatch {
+		t.Fatalf("expected one request with If-None-Match and one without, got ifNoneMatch=%v noIfNoneMatch=%v", gotIfNoneMatch, gotNoIfNoneMatch)
+	}
+	if got := s.etags[apiURL]; got != `"fresh-etag"` {
+		t.Fatalf("expected etag to be refreshed to %q, got %q", `"fresh-etag"`, got)
+	}
 }
 
 func TestGithubRunnerGetMetricSpecForScaling(t *testing.T) {

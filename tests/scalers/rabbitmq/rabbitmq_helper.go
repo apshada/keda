@@ -150,6 +150,8 @@ data:
     auth_oauth2.scope_prefix = rabbitmq.
     auth_oauth2.additional_scopes_key = {{.OAuthScopesKey}}
     auth_oauth2.jwks_url = {{.OAuthJwksURI}}
+    auth_oauth2.https.peer_verification = verify_none
+    auth_oauth2.https.hostname_verification = wildcard
     {{end}}
   enabled_plugins: |
     [rabbitmq_management].
@@ -356,6 +358,15 @@ func WithAzureADOAuth(tenantID string, clientID string) RabbitOAuthConfig {
 	}
 }
 
+func WithKeycloakOAuth(clientID, keycloakNamespace, realmName string) RabbitOAuthConfig {
+	return RabbitOAuthConfig{
+		Enable:    true,
+		ClientID:  clientID,
+		ScopesKey: "rabbitmq_permissions",
+		JwksURI:   fmt.Sprintf("https://keycloak.%s.svc.cluster.local:8443/realms/%s/protocol/openid-connect/certs", keycloakNamespace, realmName),
+	}
+}
+
 type templateData struct {
 	Namespace           string
 	Connection          string
@@ -421,6 +432,14 @@ func RMQPublishMessages(t *testing.T, namespace, connectionString, queueName str
 
 func RMQStopPublishingMessages(namespace, queueName string) {
 	_, _ = helper.ExecuteCommand(fmt.Sprintf("kubectl delete jobs/rabbitmq-publish-%s --namespace %s", queueName, namespace))
+}
+
+// RMQPurgeQueue drops the messages remaining in the queue, so scale-in
+// assertions measure the scaler reacting to an empty queue instead of how fast
+// the consumers drain the backlog.
+func RMQPurgeQueue(t *testing.T, namespace, queueName, vhost string) {
+	out, err := helper.ExecuteCommand(fmt.Sprintf("kubectl exec -n %s deploy/rabbitmq -- rabbitmqctl purge_queue %s -p %s", namespace, queueName, vhost))
+	require.NoErrorf(t, err, "cannot purge queue - %s, %s", err, out)
 }
 
 func RMQConsumeMessages(t *testing.T, namespace, connectionString, queueName string) {

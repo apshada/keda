@@ -18,13 +18,15 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/expr-lang/expr/vm"
 	v2 "k8s.io/api/autoscaling/v2"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -36,19 +38,76 @@ import (
 
 var log = logf.Log.WithName("scalers_cache")
 
+// ErrCacheClosed is returned by reader methods when the cache has been closed.
+var ErrCacheClosed = errors.New("scalers cache is closed")
+
 type ScalersCache struct {
+	ScaledObjectUpdateLock   sync.RWMutex // serializes updates to the ScaledObject
 	ScaledObject             *kedav1alpha1.ScaledObject
 	Scalers                  []ScalerBuilder
 	ScalableObjectGeneration int64
-	Recorder                 record.EventRecorder
+	Recorder                 events.EventRecorder
 	CompiledFormula          *vm.Program
+	ReaderDrainBudget        time.Duration
 	mutex                    sync.RWMutex
+	closed                   bool
+	activeReaders            sync.WaitGroup
+}
+
+// acquireReader either reserves an activeReaders slot or returns ErrCacheClosed if the cache has been closed. The returned release function should be called by defer statement.
+// If ReaderDrainBudget > 0, the slot is auto-released by a timer if release is not called within the budget - this keeps activeReaders.Wait() bounded even if a reader is stuck in a third-party SDK that ignores ctx.
+// If ReaderDrainBudget <= 0 means "no budget"; the slot is held until release is called.
+func (c *ScalersCache) acquireReader() (release func(), err error) {
+	c.mutex.RLock()
+	if c.closed {
+		c.mutex.RUnlock()
+		return nil, ErrCacheClosed
+	}
+	c.activeReaders.Add(1)
+	c.mutex.RUnlock()
+
+	var once sync.Once
+	done := func() { once.Do(c.activeReaders.Done) }
+
+	if c.ReaderDrainBudget <= 0 {
+		return done, nil
+	}
+
+	timer := time.AfterFunc(c.ReaderDrainBudget, func() {
+		fired := false
+		once.Do(func() {
+			c.activeReaders.Done()
+			fired = true
+		})
+		if fired {
+			log.Info("scaler reader exceeded ReaderDrainBudget; releasing activeReaders slot to avoid blocking cache.Close", "budget", c.ReaderDrainBudget)
+		}
+	})
+
+	return func() {
+		timer.Stop()
+		done()
+	}, nil
 }
 
 type ScalerBuilder struct {
-	Scaler       scalers.Scaler
-	ScalerConfig scalersconfig.ScalerConfig
-	Factory      func() (scalers.Scaler, *scalersconfig.ScalerConfig, error)
+	Scaler            scalers.Scaler
+	ScalerConfig      scalersconfig.ScalerConfig
+	Factory           func() (scalers.Scaler, *scalersconfig.ScalerConfig, error)
+	CachedMetricSpecs []v2.MetricSpec
+}
+
+func cloneMetricSpecs(specs []v2.MetricSpec) []v2.MetricSpec {
+	if specs == nil {
+		return nil
+	}
+
+	cloned := make([]v2.MetricSpec, 0, len(specs))
+	for i := range specs {
+		spec := specs[i]
+		cloned = append(cloned, *spec.DeepCopy())
+	}
+	return cloned
 }
 
 // GetScalers returns array of scalers and scaler config stored in the cache
@@ -70,6 +129,10 @@ func (c *ScalersCache) GetScalers() ([]scalers.Scaler, []scalersconfig.ScalerCon
 func (c *ScalersCache) getScalerBuilder(index int) (ScalerBuilder, error) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
+
+	if c.closed {
+		return ScalerBuilder{}, ErrCacheClosed
+	}
 
 	if index < 0 || index >= len(c.Scalers) {
 		return ScalerBuilder{}, fmt.Errorf("scaler with id %d not found. Len = %d", index, len(c.Scalers))
@@ -97,12 +160,23 @@ func (c *ScalersCache) GetPushScalers() []PushScalerWithTriggerIndex {
 	return result
 }
 
-// Close closes all scalers in the cache
+// Close closes all scalers in the cache. It is idempotent and waits for active readers to finish before tearing down the underlying scalers.
 func (c *ScalersCache) Close(ctx context.Context) {
+	c.mutex.Lock()
+	if c.closed {
+		c.mutex.Unlock()
+		return
+	}
+	c.closed = true
+	c.mutex.Unlock()
+
+	c.activeReaders.Wait()
+
 	c.mutex.Lock()
 	scalers := c.Scalers
 	c.Scalers = nil
 	c.mutex.Unlock()
+
 	for _, s := range scalers {
 		err := s.Scaler.Close(ctx)
 		if err != nil {
@@ -111,24 +185,38 @@ func (c *ScalersCache) Close(ctx context.Context) {
 	}
 }
 
-// GetMetricSpecForScaling returns metrics specs for all scalers in the cache
+// GetMetricSpecForScaling returns metrics specs for all scalers in the cache.
+// If a scaler has cached metric specs from StreamMetricSpec, those take precedence.
 func (c *ScalersCache) GetMetricSpecForScaling(ctx context.Context) []v2.MetricSpec {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 	var spec []v2.MetricSpec
 	for _, s := range c.Scalers {
-		spec = append(spec, s.Scaler.GetMetricSpecForScaling(ctx)...)
+		if s.CachedMetricSpecs != nil {
+			spec = append(spec, cloneMetricSpecs(s.CachedMetricSpecs)...)
+		} else {
+			spec = append(spec, s.Scaler.GetMetricSpecForScaling(ctx)...)
+		}
 	}
 	return spec
 }
 
-// GetMetricSpecForScalingForScaler returns metrics spec for a scaler identified by the metric name
+// GetMetricSpecForScalingForScaler returns metrics spec for a scaler identified by the metric name.
+// If the scaler has cached metric specs from StreamMetricSpec, those take precedence.
 func (c *ScalersCache) GetMetricSpecForScalingForScaler(ctx context.Context, index int) ([]v2.MetricSpec, error) {
-	var err error
+	release, err := c.acquireReader()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	sb, err := c.getScalerBuilder(index)
 	if err != nil {
 		return nil, err
+	}
+
+	if sb.CachedMetricSpecs != nil {
+		return cloneMetricSpecs(sb.CachedMetricSpecs), nil
 	}
 
 	metricSpecs := sb.Scaler.GetMetricSpecForScaling(ctx)
@@ -153,6 +241,12 @@ func (c *ScalersCache) GetMetricSpecForScalingForScaler(ctx context.Context, ind
 // GetMetricsAndActivityForScaler returns metric value, activity and latency for a scaler identified by the metric name
 // and by the input index (from the list of scalers in this ScaledObject)
 func (c *ScalersCache) GetMetricsAndActivityForScaler(ctx context.Context, index int, metricName string) ([]external_metrics.ExternalMetricValue, bool, time.Duration, error) {
+	release, err := c.acquireReader()
+	if err != nil {
+		return nil, false, -1, err
+	}
+	defer release()
+
 	sb, err := c.getScalerBuilder(index)
 	if err != nil {
 		return nil, false, -1, err
@@ -178,9 +272,42 @@ func (c *ScalersCache) GetMetricsAndActivityForScaler(ctx context.Context, index
 	return metric, activity, time.Since(startTime), err
 }
 
+// UpdateMetricSpecForScaler replaces the cached metric specs for a given scaler
+// index, but only when the cache still belongs to the ScaledObject identified by
+// uid and generation. The identity guard prevents a stale streaming watcher
+// (bound to an older ScaledObject generation, or to an object that was deleted
+// and recreated under the same name) from overwriting the specs of an unrelated
+// cache. A cache rebuilt for the same UID and generation (e.g. after a scaler
+// error) keeps the same identity, so legitimate cache invalidation still
+// receives streamed updates.
+//
+// The identity check and the write are performed under the same lock so the
+// validated cache cannot silently become stale between the two operations. It
+// reports whether the update was applied (false if the cache is closed, the
+// index is out of range, or the identity does not match).
+func (c *ScalersCache) UpdateMetricSpecForScaler(index int, specs []v2.MetricSpec, uid types.UID, generation int64) bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.closed || index < 0 || index >= len(c.Scalers) {
+		return false
+	}
+
+	if c.ScaledObject == nil || c.ScaledObject.UID != uid || c.ScalableObjectGeneration != generation {
+		return false
+	}
+
+	c.Scalers[index].CachedMetricSpecs = cloneMetricSpecs(specs)
+	return true
+}
+
 func (c *ScalersCache) refreshScaler(ctx context.Context, index int) (scalers.Scaler, error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+
+	if c.closed {
+		return nil, ErrCacheClosed
+	}
 
 	if index < 0 || index >= len(c.Scalers) {
 		return nil, fmt.Errorf("scaler with id %d not found. Len = %d", index, len(c.Scalers))
@@ -194,9 +321,10 @@ func (c *ScalersCache) refreshScaler(ctx context.Context, index int) (scalers.Sc
 	}
 
 	c.Scalers[index] = ScalerBuilder{
-		Scaler:       newScaler,
-		ScalerConfig: *sConfig,
-		Factory:      oldSb.Factory,
+		Scaler:            newScaler,
+		ScalerConfig:      *sConfig,
+		Factory:           oldSb.Factory,
+		CachedMetricSpecs: cloneMetricSpecs(oldSb.CachedMetricSpecs),
 	}
 
 	oldSb.Scaler.Close(ctx)

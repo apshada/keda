@@ -39,6 +39,7 @@ jtq3TnHHw+BroQPje3zF/MZTAA8Z9RejkpALMtoHeE68ar07FPlC8wZXDlfQXzYS
 PWO1PoIiMX1UsfdZ35JCOF4=
 -----END CERTIFICATE-----
 `
+
 var clientCert = `-----BEGIN CERTIFICATE-----
 MIIC9jCCAd4CFEGcfEWHP2ckC/kIgUEDUPkAVHHIMA0GCSqGSIb3DQEBCwUAMC0x
 DjAMBgNVBAMMBWtlZGEyMQswCQYDVQQGEwJVUzEOMAwGA1UEBwwFRWFydGgwIBcN
@@ -92,6 +93,121 @@ func TestExternalScalerParseMetadata(t *testing.T) {
 	}
 }
 
+func TestGetConnectionPoolKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		left     externalScalerMetadata
+		right    externalScalerMetadata
+		wantSame bool
+	}{
+		{
+			name: "same metadata yields same key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				UnsafeSsl:     false,
+				CaCert:        serverRootCA,
+				TLSClientCert: clientCert,
+				TLSClientKey:  "client-key-a",
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				UnsafeSsl:     false,
+				CaCert:        serverRootCA,
+				TLSClientCert: clientCert,
+				TLSClientKey:  "client-key-a",
+			},
+			wantSame: true,
+		},
+		{
+			name: "different tls mode yields different key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+			},
+			wantSame: false,
+		},
+		{
+			name: "different ca cert yields different key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				CaCert:        serverRootCA,
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				CaCert:        "different-ca",
+			},
+			wantSame: false,
+		},
+		{
+			name: "different client cert yields different key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				TLSClientCert: clientCert,
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				TLSClientCert: "different-client-cert",
+			},
+			wantSame: false,
+		},
+		{
+			name: "different client key yields different key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				TLSClientKey:  "client-key-a",
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				TLSClientKey:  "client-key-b",
+			},
+			wantSame: false,
+		},
+		{
+			name: "different unsafe ssl yields different key",
+			left: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				UnsafeSsl:     false,
+			},
+			right: externalScalerMetadata{
+				ScalerAddress: "grpc.example:9090",
+				EnableTLS:     true,
+				UnsafeSsl:     true,
+			},
+			wantSame: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			leftKey, err := getConnectionPoolKey(tt.left)
+			if err != nil {
+				t.Fatalf("left key error: %v", err)
+			}
+
+			rightKey, err := getConnectionPoolKey(tt.right)
+			if err != nil {
+				t.Fatalf("right key error: %v", err)
+			}
+
+			if (leftKey == rightKey) != tt.wantSame {
+				t.Fatalf("unexpected key equality: left=%d right=%d wantSame=%t", leftKey, rightKey, tt.wantSame)
+			}
+		})
+	}
+}
+
 func TestExternalPushScaler_Run(t *testing.T) {
 	const serverCount = 5
 	const iterationCount = 500
@@ -103,7 +219,7 @@ func TestExternalPushScaler_Run(t *testing.T) {
 	var resultCount int64
 
 	ctx, cancel := context.WithCancel(context.Background())
-	for i := 0; i < serverCount*iterationCount; i++ {
+	for i := range serverCount * iterationCount {
 		id := i % serverCount
 		pushScaler, _ := NewExternalPushScaler(&scalersconfig.ScalerConfig{ScalableObjectName: "app", ScalableObjectNamespace: "namespace", TriggerMetadata: map[string]string{"scalerAddress": servers[id].address}, ResolvedEnv: map[string]string{}})
 		go pushScaler.Run(ctx, replyCh[i])
@@ -123,7 +239,7 @@ func TestExternalPushScaler_Run(t *testing.T) {
 	// producer
 	for _, s := range servers {
 		go func(c chan bool) {
-			for i := 0; i < iterationCount; i++ {
+			for range iterationCount {
 				c <- true
 			}
 		}(s.publish)
@@ -156,7 +272,7 @@ type testServer struct {
 
 func createGRPCServers(count int, t *testing.T) []testServer {
 	result := make([]testServer, 0, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		grpcServer := grpc.NewServer()
 		address := fmt.Sprintf("127.0.0.1:%d", 5050+i)
 		lis, _ := net.Listen("tcp", address)
@@ -184,7 +300,7 @@ func createGRPCServers(count int, t *testing.T) []testServer {
 
 func createIsActiveChannels(count int) []chan bool {
 	result := make([]chan bool, 0, count)
-	for i := 0; i < count; i++ {
+	for range count {
 		result = append(result, make(chan bool))
 	}
 
@@ -195,13 +311,15 @@ type testExternalScaler struct {
 	// Embed the unimplemented server
 	pb.UnimplementedExternalScalerServer
 
-	t      *testing.T
-	active chan bool
+	t           *testing.T
+	active      chan bool
+	metricSpecs chan *pb.GetMetricSpecResponse
 }
 
 func (e *testExternalScaler) IsActive(context.Context, *pb.ScaledObjectRef) (*pb.IsActiveResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method IsActive not implemented")
 }
+
 func (e *testExternalScaler) StreamIsActive(_ *pb.ScaledObjectRef, epsServer pb.ExternalScaler_StreamIsActiveServer) error {
 	for {
 		select {
@@ -225,6 +343,26 @@ func (e *testExternalScaler) GetMetricSpec(context.Context, *pb.ScaledObjectRef)
 
 func (e *testExternalScaler) GetMetrics(context.Context, *pb.GetMetricsRequest) (*pb.GetMetricsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetMetrics not implemented")
+}
+
+func (e *testExternalScaler) StreamMetricSpec(_ *pb.ScaledObjectRef, server pb.ExternalScaler_StreamMetricSpecServer) error {
+	if e.metricSpecs == nil {
+		return status.Errorf(codes.Unimplemented, "method StreamMetricSpec not implemented")
+	}
+	for {
+		select {
+		case <-server.Context().Done():
+			return nil
+		case spec, ok := <-e.metricSpecs:
+			if !ok {
+				return nil
+			}
+			if err := server.Send(spec); err != nil {
+				e.t.Error(err)
+				return err
+			}
+		}
+	}
 }
 
 func TestWaitForState(t *testing.T) {
@@ -261,8 +399,7 @@ func TestWaitForState(t *testing.T) {
 	}
 	grpcClient.Connect()
 
-	waitCtx, waitCancel := context.WithCancel(context.Background())
-	defer waitCancel()
+	waitCtx := t.Context()
 
 	graceDone := make(chan struct{})
 	go func() {
@@ -305,5 +442,235 @@ func TestWaitForState(t *testing.T) {
 		return
 	case <-time.After(time.Second * 5):
 		t.Error("waitForState should be get connectivity.Shutdown.")
+	}
+}
+
+func TestExternalPushScaler_StreamMetricSpec(t *testing.T) {
+	metricSpecsCh := make(chan *pb.GetMetricSpecResponse, 1)
+	activeCh := make(chan bool, 1)
+
+	// nosemgrep: go.grpc.security.grpc-server-insecure-connection.grpc-server-insecure-connection
+	grpcServer := grpc.NewServer()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	address := lis.Addr().String()
+	pb.RegisterExternalScalerServer(grpcServer, &testExternalScaler{
+		t:           t,
+		active:      activeCh,
+		metricSpecs: metricSpecsCh,
+	})
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			t.Error(err)
+		}
+	}()
+	defer grpcServer.GracefulStop()
+
+	pushScaler, err := NewExternalPushScaler(&scalersconfig.ScalerConfig{
+		ScalableObjectName:      "app",
+		ScalableObjectNamespace: "namespace",
+		TriggerMetadata:         map[string]string{"scalerAddress": address},
+		ResolvedEnv:             map[string]string{},
+	})
+	if err != nil {
+		t.Fatalf("NewExternalPushScaler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	resultCh := make(chan bool, 10)
+	go pushScaler.Run(ctx, resultCh)
+
+	// Send a metric spec update
+	metricSpecsCh <- &pb.GetMetricSpecResponse{
+		MetricSpecs: []*pb.MetricSpec{
+			{MetricName: "test-metric", TargetSize: 100},
+		},
+	}
+
+	// Verify the metric spec is received on the channel
+	streamer, ok := pushScaler.(MetricSpecStreamer)
+	if !ok {
+		t.Fatal("externalPushScaler should implement MetricSpecStreamer")
+	}
+
+	select {
+	case specs := <-streamer.MetricSpecChan():
+		if len(specs) != 1 {
+			t.Fatalf("expected 1 metric spec, got %d", len(specs))
+		}
+		if specs[0].External == nil {
+			t.Fatal("expected external metric spec")
+		}
+		expectedTarget := int64(100)
+		actualTarget := specs[0].External.Target.AverageValue.Value()
+		if actualTarget != expectedTarget {
+			t.Fatalf("expected target %d, got %d", expectedTarget, actualTarget)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for metric spec update")
+	}
+}
+
+func TestExternalPushScaler_StreamMetricSpecUnimplemented(t *testing.T) {
+	activeCh := make(chan bool, 1)
+
+	// nosemgrep: go.grpc.security.grpc-server-insecure-connection.grpc-server-insecure-connection
+	grpcServer := grpc.NewServer()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	address := lis.Addr().String()
+	pb.RegisterExternalScalerServer(grpcServer, &testExternalScaler{
+		t:           t,
+		active:      activeCh,
+		metricSpecs: nil, // nil causes StreamMetricSpec to return Unimplemented
+	})
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			t.Error(err)
+		}
+	}()
+	defer grpcServer.GracefulStop()
+
+	pushScaler, err := NewExternalPushScaler(&scalersconfig.ScalerConfig{
+		ScalableObjectName:      "app",
+		ScalableObjectNamespace: "namespace",
+		TriggerMetadata:         map[string]string{"scalerAddress": address},
+		ResolvedEnv:             map[string]string{},
+	})
+	if err != nil {
+		t.Fatalf("NewExternalPushScaler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	resultCh := make(chan bool, 10)
+	go pushScaler.Run(ctx, resultCh)
+
+	// When StreamMetricSpec returns Unimplemented, no actual specs should
+	// be sent. The channel will be closed when the goroutine exits.
+	streamer := pushScaler.(MetricSpecStreamer)
+	select {
+	case specs, ok := <-streamer.MetricSpecChan():
+		if ok {
+			t.Fatalf("should not receive metric spec when server returns Unimplemented, got %v", specs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for channel close on Unimplemented")
+	}
+}
+
+// erroringStreamMetricSpecServer sends the configured responses and then
+// fails the stream with a non-Unimplemented error.
+type erroringStreamMetricSpecServer struct {
+	pb.UnimplementedExternalScalerServer
+	specsBeforeError []*pb.GetMetricSpecResponse
+}
+
+func (e *erroringStreamMetricSpecServer) StreamMetricSpec(_ *pb.ScaledObjectRef, server pb.ExternalScaler_StreamMetricSpecServer) error {
+	for _, spec := range e.specsBeforeError {
+		if err := server.Send(spec); err != nil {
+			return err
+		}
+	}
+	return status.Errorf(codes.Internal, "stream failed")
+}
+
+func TestStreamMetricSpecOnce_BackoffReset(t *testing.T) {
+	tests := []struct {
+		name             string
+		specsBeforeError []*pb.GetMetricSpecResponse
+		wantResetRetry   bool
+	}{
+		{
+			name:             "error before any update keeps growing backoff",
+			specsBeforeError: nil,
+			wantResetRetry:   false,
+		},
+		{
+			name: "error after a delivered update resets backoff",
+			specsBeforeError: []*pb.GetMetricSpecResponse{
+				{MetricSpecs: []*pb.MetricSpec{{MetricName: "test-metric", TargetSize: 1}}},
+			},
+			wantResetRetry: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// nosemgrep: go.grpc.security.grpc-server-insecure-connection.grpc-server-insecure-connection
+			grpcServer := grpc.NewServer()
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen failed: %v", err)
+			}
+			pb.RegisterExternalScalerServer(grpcServer, &erroringStreamMetricSpecServer{
+				specsBeforeError: tt.specsBeforeError,
+			})
+			go func() {
+				if err := grpcServer.Serve(lis); err != nil {
+					t.Error(err)
+				}
+			}()
+			defer grpcServer.GracefulStop()
+
+			pushScaler, err := NewExternalPushScaler(&scalersconfig.ScalerConfig{
+				ScalableObjectName:      "app",
+				ScalableObjectNamespace: "namespace",
+				TriggerMetadata:         map[string]string{"scalerAddress": lis.Addr().String()},
+				ResolvedEnv:             map[string]string{},
+			})
+			if err != nil {
+				t.Fatalf("NewExternalPushScaler: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			shouldStop, resetRetry := pushScaler.(*externalPushScaler).streamMetricSpecOnce(ctx)
+			if shouldStop {
+				t.Fatal("streamMetricSpecOnce should not request stop on a stream error")
+			}
+			if resetRetry != tt.wantResetRetry {
+				t.Fatalf("expected resetRetry=%v, got %v", tt.wantResetRetry, resetRetry)
+			}
+		})
+	}
+}
+
+func TestConvertMetricSpecResponse(t *testing.T) {
+	s := &externalPushScaler{
+		externalScaler: externalScaler{
+			metricType: "AverageValue",
+			metadata:   externalScalerMetadata{triggerIndex: 0},
+		},
+	}
+
+	resp := &pb.GetMetricSpecResponse{
+		MetricSpecs: []*pb.MetricSpec{
+			{MetricName: "metric-a", TargetSize: 50},
+			{MetricName: "metric-b", TargetSizeFloat: 1.5},
+		},
+	}
+
+	specs := s.buildMetricSpecs(resp)
+	if len(specs) != 2 {
+		t.Fatalf("expected 2 specs, got %d", len(specs))
+	}
+	if specs[0].External.Metric.Name != "s0-metric-a" {
+		t.Errorf("expected s0-metric-a, got %s", specs[0].External.Metric.Name)
+	}
+	if specs[1].External.Metric.Name != "s0-metric-b" {
+		t.Errorf("expected s0-metric-b, got %s", specs[1].External.Metric.Name)
+	}
+	// First spec uses integer target
+	if specs[0].External.Target.AverageValue.Value() != 50 {
+		t.Errorf("expected target 50, got %d", specs[0].External.Target.AverageValue.Value())
 	}
 }

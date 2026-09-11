@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/go-logr/logr"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
@@ -23,6 +24,7 @@ type awsDynamoDBScaler struct {
 	metricType v2.MetricTargetType
 	metadata   *awsDynamoDBMetadata
 	dbClient   dynamodb.QueryAPIClient
+	httpClient *http.Client
 	logger     logr.Logger
 }
 
@@ -57,7 +59,8 @@ func NewAwsDynamoDBScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 	if err != nil {
 		return nil, fmt.Errorf("error parsing DynamoDb metadata: %w", err)
 	}
-	dbClient, err := createDynamoDBClient(ctx, meta)
+	httpClient := awsutils.NewHTTPClient()
+	dbClient, err := createDynamoDBClient(ctx, meta, httpClient)
 	if err != nil {
 		return nil, fmt.Errorf("error when creating dynamodb client: %w", err)
 	}
@@ -65,6 +68,7 @@ func NewAwsDynamoDBScaler(ctx context.Context, config *scalersconfig.ScalerConfi
 		metricType: metricType,
 		metadata:   meta,
 		dbClient:   dbClient,
+		httpClient: httpClient,
 		logger:     InitializeLogger(config, "aws_dynamodb_scaler"),
 	}, nil
 }
@@ -129,7 +133,7 @@ func parseAwsDynamoDBMetadata(config *scalersconfig.ScalerConfig) (*awsDynamoDBM
 	return meta, nil
 }
 
-func createDynamoDBClient(ctx context.Context, metadata *awsDynamoDBMetadata) (*dynamodb.Client, error) {
+func createDynamoDBClient(ctx context.Context, metadata *awsDynamoDBMetadata, httpClient *http.Client) (*dynamodb.Client, error) {
 	cfg, err := awsutils.GetAwsConfig(ctx, metadata.awsAuthorization)
 	if err != nil {
 		return nil, err
@@ -138,6 +142,9 @@ func createDynamoDBClient(ctx context.Context, metadata *awsDynamoDBMetadata) (*
 	return dynamodb.NewFromConfig(*cfg, func(options *dynamodb.Options) {
 		if metadata.AwsEndpoint != "" {
 			options.BaseEndpoint = aws.String(metadata.AwsEndpoint)
+		}
+		if httpClient != nil {
+			options.HTTPClient = httpClient
 		}
 	}), nil
 }
@@ -170,6 +177,9 @@ func (s *awsDynamoDBScaler) GetMetricSpecForScaling(context.Context) []v2.Metric
 
 func (s *awsDynamoDBScaler) Close(context.Context) error {
 	awsutils.ClearAwsConfig(s.metadata.awsAuthorization)
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
 	return nil
 }
 
@@ -214,7 +224,7 @@ func json2Map(js string) (m map[string]string, err error) {
 
 // json2DynamoMap converts Json to map[string]types.AttributeValue
 func json2DynamoMap(js string) (map[string]types.AttributeValue, error) {
-	var valueMap map[string]interface{}
+	var valueMap map[string]any
 	err := json.Unmarshal([]byte(js), &valueMap)
 	if err != nil {
 		return nil, err
@@ -232,10 +242,10 @@ func json2DynamoMap(js string) (map[string]types.AttributeValue, error) {
 	return attributeValues, nil
 }
 
-func attributeValueFromInterface(value interface{}) (types.AttributeValue, error) {
+func attributeValueFromInterface(value any) (types.AttributeValue, error) {
 	var err error
 	switch v := value.(type) {
-	case map[string]interface{}:
+	case map[string]any:
 		// Check the nested map to determine the data type
 		for dataType, val := range v {
 			switch dataType {
@@ -253,7 +263,7 @@ func attributeValueFromInterface(value interface{}) (types.AttributeValue, error
 			case "B":
 				return &types.AttributeValueMemberB{Value: []byte(val.(string))}, nil
 			case "L":
-				listValues := val.([]interface{})
+				listValues := val.([]any)
 				list := make([]types.AttributeValue, len(listValues))
 				for i, listVal := range listValues {
 					list[i], err = attributeValueFromInterface(listVal)
@@ -263,7 +273,7 @@ func attributeValueFromInterface(value interface{}) (types.AttributeValue, error
 				}
 				return &types.AttributeValueMemberL{Value: list}, nil
 			case "M":
-				mapValues := val.(map[string]interface{})
+				mapValues := val.(map[string]any)
 				m := make(map[string]types.AttributeValue)
 				for mapKey, mapVal := range mapValues {
 					mapAttr, err := attributeValueFromInterface(mapVal)

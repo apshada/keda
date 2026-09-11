@@ -18,10 +18,12 @@ package main
 
 import (
 	"flag"
+	"maps"
 	"os"
 	"time"
 
 	"github.com/spf13/pflag"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	apimachineryruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	kubeinformers "k8s.io/client-go/informers"
@@ -29,8 +31,10 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -68,6 +72,7 @@ func init() {
 func main() {
 	var enablePrometheusMetrics bool
 	var enableOpenTelemetryMetrics bool
+	var enableHighCardinalityLabels bool
 	var metricsAddr string
 	var probeAddr string
 	var metricsServiceAddr string
@@ -90,8 +95,12 @@ func main() {
 	var enableWebhookPatching bool
 	var enableAPIServicePatching bool
 	var filePathAuthRootPath string
+	var httpMaxIdleConns int
+	var httpMaxIdleConnsPerHost int
+	var httpIdleConnTimeout time.Duration
 	pflag.BoolVar(&enablePrometheusMetrics, "enable-prometheus-metrics", true, "Enable the prometheus metric of keda-operator.")
 	pflag.BoolVar(&enableOpenTelemetryMetrics, "enable-opentelemetry-metrics", false, "Enable the opentelemetry metric of keda-operator.")
+	pflag.BoolVar(&enableHighCardinalityLabels, "enable-high-cardinality-metrics-labels", false, "Enable high-cardinality labels for scaler HTTP request duration metrics.")
 	pflag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the prometheus metric endpoint binds to.")
 	pflag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	pflag.StringVar(&metricsServiceAddr, "metrics-service-bind-address", ":9666", "The address the gRPRC Metrics Service endpoint binds to.")
@@ -116,23 +125,48 @@ func main() {
 	pflag.BoolVar(&enableWebhookPatching, "enable-webhook-patching", true, "Enable patching of webhook resources. Defaults to true.")
 	pflag.BoolVar(&enableAPIServicePatching, "enable-apiservice-patching", true, "Enable patching of APIService resources. Defaults to true.")
 	pflag.StringVar(&filePathAuthRootPath, "filepath-auth-root-path", "", "Allowed filesystem path for KEDA to read auth from.")
+	pflag.IntVar(&httpMaxIdleConns, "http-max-idle-conns", 0, "Maximum number of idle HTTP connections across all hosts. Zero means no limit.")
+	pflag.IntVar(&httpMaxIdleConnsPerHost, "http-max-idle-conns-per-host", 1000, "Maximum number of idle HTTP connections to keep per host.")
+	pflag.DurationVar(&httpIdleConnTimeout, "http-idle-conn-timeout", 90*time.Second, "Maximum time an idle HTTP connection remains in the pool. Must be greater than zero.")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
+
+	// Register klog flags on flag.CommandLine so they can be set programmatically.
+	klog.InitFlags(nil)
+
+	// Opt into the new klog behavior so that -stderrthreshold is honored even
+	// when -logtostderr=true (the default). Without this, all log levels are
+	// unconditionally sent to stderr and users cannot filter by severity.
+	// Requires klog v2.140.0+ (kubernetes/klog#432).
+	if err := flag.CommandLine.Set("legacy_stderr_threshold_behavior", "false"); err != nil {
+		klog.Fatalf("Failed to set legacy_stderr_threshold_behavior: %v", err)
+	}
+	if err := flag.CommandLine.Set("stderrthreshold", "INFO"); err != nil {
+		klog.Fatalf("Failed to set stderrthreshold: %v", err)
+	}
+
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	pflag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
-	ctx := ctrl.SetupSignalHandler()
-
-	if err := kedautil.ConfigureMaxProcs(setupLog); err != nil {
-		setupLog.Info("failed to set max procs, using default GOMAXPROCS", "error", err)
+	if err := kedautil.ConfigureHTTPTransport(kedautil.HTTPTransportConfig{
+		MaxIdleConns:        httpMaxIdleConns,
+		MaxIdleConnsPerHost: httpMaxIdleConnsPerHost,
+		IdleConnTimeout:     httpIdleConnTimeout,
+	}); err != nil {
+		setupLog.Error(err, "invalid HTTP transport configuration")
+		os.Exit(1)
 	}
+
+	ctx := ctrl.SetupSignalHandler()
 
 	namespaces, err := kedautil.GetWatchNamespaces()
 	if err != nil {
 		setupLog.Error(err, "failed to get watch namespace")
 		os.Exit(1)
 	}
+
+	byObject := buildWatchLabelSelectorByObjectOrDie()
 
 	leaseDuration, err := kedautil.ResolveOsEnvDuration("KEDA_OPERATOR_LEADER_ELECTION_LEASE_DURATION")
 	if err != nil {
@@ -164,7 +198,11 @@ func main() {
 	if !enablePrometheusMetrics {
 		metricsAddr = "0"
 	}
-	metricscollector.NewMetricsCollectors(enablePrometheusMetrics, enableOpenTelemetryMetrics)
+	metricscollector.NewMetricsCollectors(metricscollector.Options{
+		EnablePrometheusMetrics:     enablePrometheusMetrics,
+		EnableOpenTelemetryMetrics:  enableOpenTelemetryMetrics,
+		EnableHighCardinalityLabels: enableHighCardinalityLabels,
+	})
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme,
@@ -176,6 +214,8 @@ func main() {
 		}),
 		Cache: ctrlcache.Options{
 			DefaultNamespaces: namespaces,
+			DefaultTransform:  kedautil.CacheObjectTransform,
+			ByObject:          byObject,
 		},
 		HealthProbeBindAddress:  probeAddr,
 		PprofBindAddress:        profilingAddr,
@@ -217,7 +257,7 @@ func main() {
 	}
 
 	globalHTTPTimeout := time.Duration(globalHTTPTimeoutMS) * time.Millisecond
-	eventRecorder := mgr.GetEventRecorderFor("keda-operator")
+	eventRecorder := mgr.GetEventRecorder("keda-operator")
 
 	kubeClientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
@@ -358,4 +398,38 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// buildWatchLabelSelectorByObjectOrDie composes the cache.ByObject filters for
+// both WATCH_LABEL_SELECTOR (SO/SJ/HPA) and WATCH_LABEL_SELECTOR_FOR_TRIGGERAUTH
+// (TA/CTA). Returning nil means no filter is applied at the cache level.
+//
+// The two selectors are independent so a cluster-scoped CTA can be shared
+// across operators scoped to different WATCH_LABEL_SELECTOR values.
+//
+// Follows the fail-fast pattern of ctrl.GetConfigOrDie() used elsewhere in
+// main: malformed env vars exit the process at startup rather than propagate.
+func buildWatchLabelSelectorByObjectOrDie() map[client.Object]ctrlcache.ByObject {
+	byObject, err := kedautil.WatchLabelSelectorByObject(
+		&kedav1alpha1.ScaledObject{},
+		&kedav1alpha1.ScaledJob{},
+		&autoscalingv2.HorizontalPodAutoscaler{},
+	)
+	if err != nil {
+		setupLog.Error(err, "failed to parse WATCH_LABEL_SELECTOR")
+		os.Exit(1)
+	}
+	taByObject, err := kedautil.WatchLabelSelectorForTriggerAuthByObject(
+		&kedav1alpha1.TriggerAuthentication{},
+		&kedav1alpha1.ClusterTriggerAuthentication{},
+	)
+	if err != nil {
+		setupLog.Error(err, "failed to parse WATCH_LABEL_SELECTOR_FOR_TRIGGERAUTH")
+		os.Exit(1)
+	}
+	if byObject == nil {
+		return taByObject
+	}
+	maps.Copy(byObject, taByObject)
+	return byObject
 }

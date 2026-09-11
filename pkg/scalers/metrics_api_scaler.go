@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/tidwall/gjson"
 	"golang.org/x/sync/semaphore"
@@ -58,7 +59,7 @@ type metricsAPIScalerMetadata struct {
 
 const (
 	methodValueQuery           = "query"
-	valueLocationWrongErrorMsg = "valueLocation must point to value of type number or a string representing a Quantity got: '%s'"
+	valueLocationWrongErrorMsg = "valueLocation %q must point to a numeric value or a string parseable as a Quantity, got %s"
 )
 
 const secureHTTPScheme = "https"
@@ -81,6 +82,10 @@ const (
 	SumAggregationType     AggregationType = "sum"
 	MaxAggregationType     AggregationType = "max"
 	MinAggregationType     AggregationType = "min"
+)
+
+var (
+	promQLParser parser.Parser = parser.NewParser(parser.Options{})
 )
 
 // NewMetricsAPIScaler creates a new HTTP scaler
@@ -155,7 +160,7 @@ func GetValueFromResponse(body []byte, valueLocation string, format APIFormat) (
 
 // getValueFromPrometheusResponse uses provided valueLocation to access the numeric value in provided body
 func getValueFromPrometheusResponse(body []byte, valueLocation string) (float64, error) {
-	matchers, err := parser.ParseMetricSelector(valueLocation)
+	matchers, err := promQLParser.ParseMetricSelector(valueLocation)
 	if err != nil {
 		return 0, err
 	}
@@ -175,7 +180,7 @@ func getValueFromPrometheusResponse(body []byte, valueLocation string) (float64,
 	}
 
 	reader := strings.NewReader(bodyStr)
-	familiesParser := expfmt.TextParser{}
+	familiesParser := expfmt.NewTextParser(model.UTF8Validation)
 	families, err := familiesParser.TextToMetricFamilies(reader)
 	if err != nil {
 		return 0, fmt.Errorf("prometheus format parsing error: %w", err)
@@ -235,19 +240,19 @@ func getValueFromJSONResponse(body []byte, valueLocation string) (float64, error
 	if r.Type == gjson.String {
 		v, err := resource.ParseQuantity(r.String())
 		if err != nil {
-			return 0, fmt.Errorf(valueLocationWrongErrorMsg, r.String())
+			return 0, fmt.Errorf("valueLocation %q points to a string that is not parseable as a Quantity", valueLocation)
 		}
 		return v.AsApproximateFloat64(), nil
 	}
 	if r.Type != gjson.Number {
-		return 0, fmt.Errorf(valueLocationWrongErrorMsg, r.Type.String())
+		return 0, fmt.Errorf(valueLocationWrongErrorMsg, valueLocation, r.Type.String())
 	}
 	return r.Num, nil
 }
 
 // getValueFromXMLResponse uses provided valueLocation to access the numeric value in provided body
 func getValueFromXMLResponse(body []byte, valueLocation string) (float64, error) {
-	var xmlMap map[string]interface{}
+	var xmlMap map[string]any
 	err := xml.Unmarshal(body, &xmlMap)
 	if err != nil {
 		return 0, err
@@ -268,18 +273,18 @@ func getValueFromXMLResponse(body []byte, valueLocation string) (float64, error)
 	case string:
 		r, err := resource.ParseQuantity(v)
 		if err != nil {
-			return 0, fmt.Errorf(valueLocationWrongErrorMsg, v)
+			return 0, fmt.Errorf("valueLocation %q points to a string that is not parseable as a Quantity", valueLocation)
 		}
 		return r.AsApproximateFloat64(), nil
 	default:
-		return 0, fmt.Errorf(valueLocationWrongErrorMsg, v)
+		return 0, fmt.Errorf(valueLocationWrongErrorMsg, valueLocation, fmt.Sprintf("%T", v))
 	}
 }
 
 // getValueFromYAMLResponse uses provided valueLocation to access the numeric value in provided body
 // using generic ketautil.GetValueByPath
 func getValueFromYAMLResponse(body []byte, valueLocation string) (float64, error) {
-	var yamlMap map[string]interface{}
+	var yamlMap map[string]any
 	err := yaml.Unmarshal(body, &yamlMap)
 	if err != nil {
 		return 0, err
@@ -300,11 +305,11 @@ func getValueFromYAMLResponse(body []byte, valueLocation string) (float64, error
 	case string:
 		r, err := resource.ParseQuantity(v)
 		if err != nil {
-			return 0, fmt.Errorf(valueLocationWrongErrorMsg, v)
+			return 0, fmt.Errorf("valueLocation %q points to a string that is not parseable as a Quantity", valueLocation)
 		}
 		return r.AsApproximateFloat64(), nil
 	default:
-		return 0, fmt.Errorf(valueLocationWrongErrorMsg, v)
+		return 0, fmt.Errorf(valueLocationWrongErrorMsg, valueLocation, fmt.Sprintf("%T", v))
 	}
 }
 
@@ -398,6 +403,10 @@ func (s *metricsAPIScaler) getMetricValue(ctx context.Context) (float64, error) 
 }
 
 func (s *metricsAPIScaler) aggregateMetricsFromMultipleEndpoints(ctx context.Context, endpointsUrls []string) (float64, error) {
+	if len(endpointsUrls) == 0 {
+		return 0, fmt.Errorf("no endpoints provided")
+	}
+
 	// call s.getMetricValueFromURL() for each endpointsUrls in parallel goroutines (maximum 5 at a time) and sum them up
 	const maxGoroutines = 5
 	var mu sync.Mutex
@@ -455,6 +464,12 @@ func (s *metricsAPIScaler) aggregateMetricsFromMultipleEndpoints(ctx context.Con
 		err = fmt.Errorf("could not get any metric successfully from the %d provided endpoints", len(endpointsUrls))
 	}
 	if s.metadata.AggregationType == AverageAggregationType {
+		if expectedNbMetrics == 0 {
+			if err == nil {
+				err = fmt.Errorf("no metrics were successfully fetched from the endpoints")
+			}
+			return 0, err
+		}
 		aggregation /= float64(expectedNbMetrics)
 	}
 	s.logger.V(1).Info(fmt.Sprintf("fetched %d metrics out of %d endpoints from kubernetes service : %s is %v\n", expectedNbMetrics, len(endpointsUrls), s.metadata.AggregationType, aggregation))

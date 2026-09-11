@@ -63,6 +63,7 @@ const FallbackBehaviorStatic = "static"
 const FallbackBehaviorCurrentReplicas = "currentReplicas"
 const FallbackBehaviorCurrentReplicasIfHigher = "currentReplicasIfHigher"
 const FallbackBehaviorCurrentReplicasIfLower = "currentReplicasIfLower"
+const FallbackBehaviorScalingModifiers = "scalingModifiers"
 const ForceActivationAnnotation = "autoscaling.keda.sh/force-activation"
 
 // HealthStatus is the status for a ScaledObject's health
@@ -135,7 +136,7 @@ type Fallback struct {
 	Replicas int32 `json:"replicas"`
 	// +optional
 	// +kubebuilder:default=static
-	// +kubebuilder:validation:Enum=static;currentReplicas;currentReplicasIfHigher;currentReplicasIfLower
+	// +kubebuilder:validation:Enum=static;currentReplicas;currentReplicasIfHigher;currentReplicasIfLower;scalingModifiers
 	Behavior string `json:"behavior,omitempty"`
 }
 
@@ -224,10 +225,6 @@ type ScaledObjectList struct {
 	Items           []ScaledObject `json:"items"`
 }
 
-func init() {
-	SchemeBuilder.Register(&ScaledObject{}, &ScaledObjectList{})
-}
-
 // GenerateIdentifier returns identifier for the object in for "kind.namespace.name"
 func (so *ScaledObject) GenerateIdentifier() string {
 	return GenerateIdentifier("ScaledObject", so.Namespace, so.Name)
@@ -298,6 +295,39 @@ func (so *ScaledObject) IsUsingModifiers() bool {
 	return so.Spec.Advanced != nil && !reflect.DeepEqual(so.Spec.Advanced.ScalingModifiers, ScalingModifiers{})
 }
 
+// IsPollingIntervalRelevant reports whether KEDA's own scale loop still needs to poll the triggers.
+// Polling is only relevant when the scale loop can move the workload outside the HPA-managed
+// range (scale to zero when minReplicaCount is 0, or to the idle replica count when idle mode
+// is enabled), or when a trigger relies on cached metrics that the loop must refresh for the HPA.
+// Otherwise the HPA drives all scaling and the scale loop has nothing to contribute, so pollingInterval
+// has no effect.
+func (so *ScaledObject) IsPollingIntervalRelevant() bool {
+	minReplicas := int32(0)
+	if so.Spec.MinReplicaCount != nil {
+		minReplicas = *so.Spec.MinReplicaCount
+	}
+	if minReplicas == 0 || so.Spec.IdleReplicaCount != nil {
+		return true
+	}
+	for _, trigger := range so.Spec.Triggers {
+		if trigger.UseCachedMetrics {
+			return true
+		}
+	}
+	return false
+}
+
+// UsesHPAObservations reports whether the state of the ScaledObject may be derived from the metric
+// observations of the HPA-driven metrics path instead of querying the trigger sources on KEDA's own
+// scale loop. This is only allowed when pollingInterval is not relevant (see
+// IsPollingIntervalRelevant): the HPA then drives all scaling and already queries every external
+// metric itself, so querying the trigger sources on the scale loop would only duplicate those
+// queries. ScaledObjects using scaling modifiers are excluded because trigger activity is then
+// derived from the composite formula over all metrics at once.
+func (so *ScaledObject) UsesHPAObservations() bool {
+	return !so.IsPollingIntervalRelevant() && !so.IsUsingModifiers()
+}
+
 // GetHPAMinReplicas returns MinReplicas based on definition in ScaledObject or default value if not defined
 func (so *ScaledObject) GetHPAMinReplicas() *int32 {
 	if so.Spec.MinReplicaCount != nil && *so.Spec.MinReplicaCount > 0 {
@@ -340,6 +370,11 @@ func (so *ScaledObject) SetStatusTriggersActivity(m map[string]TriggerActivitySt
 // GetStatusExternalMetricNames returns the list of external metric names defined in the ScaledObject status
 func (so *ScaledObject) GetStatusExternalMetricNames() []string {
 	return so.Status.ExternalMetricNames
+}
+
+// FallbackScalingModifiers returns whether the fallback behavior is set to use scaling modifiers
+func (so *ScaledObject) FallbackScalingModifiers() bool {
+	return so.Spec.Fallback != nil && so.Spec.Fallback.Behavior == FallbackBehaviorScalingModifiers
 }
 
 // CheckReplicaCountBoundsAreValid checks that Idle/Min/Max ReplicaCount defined in ScaledObject are correctly specified
